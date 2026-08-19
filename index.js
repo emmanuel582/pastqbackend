@@ -55,6 +55,12 @@ app.get('/', (_req, res) => {
 });
 
 app.use('/api/auth', authRoutes);
+
+// Give upload routes extra time — mobile bulk-uploads can be large
+app.use('/api/vision', (req, _res, next) => {
+  req.setTimeout(5 * 60 * 1000); // 5 minutes
+  next();
+});
 app.use('/api/vision', visionRoutes);
 
 app.get('/api/health', (_req, res) => {

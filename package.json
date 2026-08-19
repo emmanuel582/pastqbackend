@@ -1,0 +1,22 @@
+{
+  "name": "pastq-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test:openrouter:e2e": "node scripts/test-openrouter-e2e.js"
+  },
+  "description": "PastQ backend API — OpenRouter Gemini OCR extraction",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "multer": "^2.2.0",
+    "nanoid": "^5.1.5"
+  }
+}

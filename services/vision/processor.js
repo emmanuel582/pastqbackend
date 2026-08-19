@@ -127,23 +127,13 @@ async function runOcrImage(dataUrl) {
 }
 
 async function runOcrPdf(dataUrl) {
-  if (IS_OPENROUTER) {
-    return withRetry(
-      async () => openrouterProvider.ocrPdf(dataUrl, { model: MODELS.ocr }),
-      { label: 'openrouter-ocr-pdf' }
-    );
-  }
-  if (IS_GROQ) {
-    return withRetry(
-      async () => groqProvider.ocrPdf(dataUrl, { model: MODELS.ocr }),
-      { label: 'groq-ocr-pdf' }
-    );
-  }
+  // OpenRouter/Groq don't natively ingest raw PDF buffers for OCR well.
+  // Mistral's dedicated OCR endpoint is perfect for this: highly accurate and only $0.004/page.
   const mistral = getMistral();
   return withRetry(
     async () =>
       mistral.ocr.process({
-        model: MODELS.ocr,
+        model: 'mistral-ocr-latest', // Hardcode model to guarantee it works regardless of VISION_OCR_MODEL
         document: { type: 'document_url', documentUrl: dataUrl },
       }),
     { label: 'ocr-pdf' }

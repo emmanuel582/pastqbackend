@@ -1,13 +1,13 @@
-const { Mistral } = require('@mistralai/mistralai');
-const groqProvider = require('./groq');
-const {
+import {  Mistral  } from '@mistralai/mistralai';
+import * as groqProvider from './groq.js';
+import { 
   CLASSIFY_PROMPT,
   EXTRACT_PROMPT,
   ANSWER_KEY_PROMPT,
   buildMemoryBlock,
-} = require('./prompts');
-const { getSession, saveSession, updateProgress } = require('./store');
-const {
+ } from './prompts.js';
+import { getSession, saveSession, updateProgress, getJobs, saveJobs } from './store.js';
+import { 
   PROVIDER,
   IS_GROQ,
   MODELS,
@@ -16,7 +16,7 @@ const {
   pricingForModel,
   needsStrongExtract,
   heuristicPageType,
-} = require('./models');
+ } from './models.js';
 
 const MAX_RETRIES = 4;
 const activeWorkers = new Set();
@@ -502,7 +502,6 @@ async function processOnePage(session, page) {
     }
     let dataUrl = page.dataUrl;
     if (!dataUrl && page.imagePath) {
-      const fs = require('fs');
       const buf = fs.readFileSync(page.imagePath);
       dataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
     }
@@ -725,7 +724,6 @@ async function runSessionWorker(sessionId) {
     }
 
     // compatibility: mirror into jobs.json shape for old client pollers
-    const { getJobs, saveJobs } = require('./store');
     const jobs = getJobs();
     jobs[sessionId] = {
       id: sessionId,
@@ -760,7 +758,7 @@ function kickoffSession(sessionId) {
   });
 }
 
-module.exports = {
+export {
   PROVIDER,
   PRICING,
   USD_TO_NGN,

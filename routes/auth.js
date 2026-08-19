@@ -1,6 +1,6 @@
-const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
-const ws = require('ws');
+import express from 'express';
+import {  createClient  } from '@supabase/supabase-js';
+import ws from 'ws';
 
 const router = express.Router();
 
@@ -111,4 +111,4 @@ router.post('/logout', async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;

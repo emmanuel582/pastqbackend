@@ -1,7 +1,9 @@
-const express = require('express');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const authRoutes = require('./routes/auth');
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import authRoutes from './routes/auth.js';
+import visionRoutes from './routes/vision.js';
+import { PROVIDER, MODELS } from './services/vision/models.js';
 
 dotenv.config();
 
@@ -53,7 +55,6 @@ app.get('/', (_req, res) => {
 });
 
 app.use('/api/auth', authRoutes);
-const visionRoutes = require('./routes/vision');
 app.use('/api/vision', visionRoutes);
 
 app.get('/api/health', (_req, res) => {
@@ -69,7 +70,6 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  const { PROVIDER, MODELS } = require('./services/vision/models');
   console.log(`PastQ backend listening on 0.0.0.0:${PORT}`);
   console.log(`[vision] provider=${PROVIDER} ocr=${MODELS.ocr} cheap=${MODELS.cheap} strong=${MODELS.strong}`);
 });

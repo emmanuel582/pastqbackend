@@ -13,10 +13,17 @@
   },
   "description": "PastQ backend API — OpenRouter Gemini OCR extraction",
   "dependencies": {
+    "@mistralai/mistralai": "^2.6.3",
+    "@supabase/supabase-js": "^2.112.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "groq-sdk": "^1.5.0",
+    "heic-convert": "^2.1.0",
     "multer": "^2.2.0",
-    "nanoid": "^5.1.5"
+    "nanoid": "^5.1.5",
+    "pdf-to-img": "^6.2.0",
+    "sharp": "^0.35.3",
+    "ws": "^8.21.3"
   }
 }

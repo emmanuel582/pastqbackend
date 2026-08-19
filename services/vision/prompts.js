@@ -105,7 +105,7 @@ function buildMemoryBlock(memory) {
 - lastHeadings: ${JSON.stringify(m.lastHeadings || [])}`;
 }
 
-module.exports = {
+export {
   CLASSIFY_PROMPT,
   EXTRACT_PROMPT,
   ANSWER_KEY_PROMPT,

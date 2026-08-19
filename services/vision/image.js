@@ -1,9 +1,9 @@
-const sharp = require('sharp');
-const heicConvert = require('heic-convert');
-const fs = require('fs');
-const path = require('path');
-const { pageDir } = require('./store');
-const { IMAGE_PREP } = require('./models');
+import sharp from 'sharp';
+import heicConvert from 'heic-convert';
+import fs from 'fs';
+import path from 'path';
+import {  pageDir  } from './store.js';
+import {  IMAGE_PREP  } from './models.js';
 
 /**
  * Normalize uploads for OCR: rotate, cap dimensions, moderate JPEG quality.
@@ -59,7 +59,7 @@ function isPdf(file) {
   return mime === 'application/pdf' || name.endsWith('.pdf');
 }
 
-module.exports = {
+export {
   toJpegBuffer,
   savePageImage,
   isPdf,

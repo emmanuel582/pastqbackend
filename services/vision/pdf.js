@@ -4,9 +4,9 @@
  * then fed into the same classify → extract → group pipeline as phone photos.
  * Source PDF is persisted under data/pages/<sessionId>/source.pdf for resume/debug.
  */
-const fs = require('fs');
-const path = require('path');
-const { pageDir } = require('./store');
+import fs from 'fs';
+import path from 'path';
+import {  pageDir  } from './store.js';
 
 async function savePdfFile(sessionId, buffer, originalName = 'upload.pdf') {
   const dir = pageDir(sessionId);
@@ -29,7 +29,7 @@ function ocrPagesToQueueItems(ocrPages, startIndex = 0) {
   }));
 }
 
-module.exports = {
+export {
   savePdfFile,
   ocrPagesToQueueItems,
 };

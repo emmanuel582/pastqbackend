@@ -1,9 +1,9 @@
-const express = require('express');
+import express from 'express';
 const router = express.Router();
-const multer = require('multer');
-const crypto = require('crypto');
+import multer from 'multer';
+import crypto from 'crypto';
 
-const {
+import { 
   getJobs,
   saveJobs,
   createSession,
@@ -13,10 +13,10 @@ const {
   deleteSession,
   updateProgress,
   publicSession,
-} = require('../services/vision/store');
-const { savePageImage, isPdf } = require('../services/vision/image');
-const { savePdfFile } = require('../services/vision/pdf');
-const {
+ } from '../services/vision/store.js';
+import {  savePageImage, isPdf  } from '../services/vision/image.js';
+import {  savePdfFile  } from '../services/vision/pdf.js';
+import { 
   kickoffSession,
   runOcrPdf,
   addCost,
@@ -24,7 +24,7 @@ const {
   rebuildGroups,
   applyAnswerKeys,
   MAX_RETRIES,
-} = require('../services/vision/processor');
+ } from '../services/vision/processor.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -438,4 +438,4 @@ router.delete('/jobs/:id', (req, res) => {
   res.json({ success: true });
 });
 
-module.exports = router;
+export default router;

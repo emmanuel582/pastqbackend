@@ -1,5 +1,9 @@
-const fs = require('fs');
-const path = require('path');
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+import fs from 'fs';
+import path from 'path';
 
 const DATA_DIR = path.join(__dirname, '../../data');
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
@@ -171,7 +175,7 @@ function publicSession(session) {
   };
 }
 
-module.exports = {
+export {
   JOBS_FILE,
   PAGES_DIR,
   getJobs,

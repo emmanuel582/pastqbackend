@@ -7,8 +7,8 @@
  * A 1600px exam page is only ~2.5k input; 8192 completion was what blew the cap.
  * Keep image quality high and continue if output hits the completion limit.
  */
-const Groq = require('groq-sdk');
-const sharp = require('sharp');
+import Groq from 'groq-sdk';
+import sharp from 'sharp';
 
 const OCR_PROMPT = `You are a precise OCR engine for exam past-question pages.
 
@@ -299,7 +299,7 @@ async function chatJson(system, user, { maxTokens = 8192, model } = {}) {
   };
 }
 
-module.exports = {
+export {
   ocrImage,
   ocrPdf,
   chatJson,

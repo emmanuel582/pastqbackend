@@ -123,7 +123,7 @@ function heuristicPageType(ocrMarkdown) {
   return null;
 }
 
-module.exports = {
+export {
   PROVIDER,
   IS_GROQ,
   MODELS,

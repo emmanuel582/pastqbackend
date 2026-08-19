@@ -1,5 +1,6 @@
 import {  Mistral  } from '@mistralai/mistralai';
 import * as groqProvider from './groq.js';
+import * as openrouterProvider from './openrouterProvider.js';
 import { 
   CLASSIFY_PROMPT,
   EXTRACT_PROMPT,
@@ -10,6 +11,7 @@ import { getSession, saveSession, updateProgress, getJobs, saveJobs } from './st
 import { 
   PROVIDER,
   IS_GROQ,
+  IS_OPENROUTER,
   MODELS,
   PRICING,
   USD_TO_NGN,
@@ -101,6 +103,12 @@ function addCost(session, { ocrPages = 0, usage, model } = {}) {
 }
 
 async function runOcrImage(dataUrl) {
+  if (IS_OPENROUTER) {
+    return withRetry(
+      async () => openrouterProvider.ocrImage(dataUrl, { model: MODELS.ocr }),
+      { label: 'openrouter-ocr-image' }
+    );
+  }
   if (IS_GROQ) {
     return withRetry(
       async () => groqProvider.ocrImage(dataUrl, { model: MODELS.ocr }),
@@ -119,6 +127,12 @@ async function runOcrImage(dataUrl) {
 }
 
 async function runOcrPdf(dataUrl) {
+  if (IS_OPENROUTER) {
+    return withRetry(
+      async () => openrouterProvider.ocrPdf(dataUrl, { model: MODELS.ocr }),
+      { label: 'openrouter-ocr-pdf' }
+    );
+  }
   if (IS_GROQ) {
     return withRetry(
       async () => groqProvider.ocrPdf(dataUrl, { model: MODELS.ocr }),
@@ -137,6 +151,13 @@ async function runOcrPdf(dataUrl) {
 }
 
 async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, label = 'chat-json' } = {}) {
+  if (IS_OPENROUTER) {
+    const response = await withRetry(
+      async () => openrouterProvider.chatJson(system, user, { maxTokens, model }),
+      { label: `${label}:${model}` }
+    );
+    return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
+  }
   if (IS_GROQ) {
     const response = await withRetry(
       async () => groqProvider.chatJson(system, user, { maxTokens, model }),

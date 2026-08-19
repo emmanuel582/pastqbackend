@@ -6,13 +6,20 @@
  * Providers: groq (default for testing) | mistral | gemini (future)
  * Groq picks: qwen/qwen3.6-27b OCR, gpt-oss-20b cheap, gpt-oss-120b strong
  */
-const PROVIDER = (process.env.VISION_PROVIDER || 'groq').toLowerCase();
+const PROVIDER = (process.env.VISION_PROVIDER || 'openrouter').toLowerCase();
 const IS_GROQ = PROVIDER === 'groq';
+const IS_OPENROUTER = PROVIDER === 'openrouter';
 
 const GROQ_MODELS = {
   ocr: process.env.VISION_OCR_MODEL || 'qwen/qwen3.6-27b',
   cheap: process.env.VISION_CHEAP_MODEL || 'openai/gpt-oss-20b',
   strong: process.env.VISION_STRONG_MODEL || 'openai/gpt-oss-120b',
+};
+
+const OPENROUTER_MODELS = {
+  ocr: process.env.VISION_OCR_MODEL || 'qwen/qwen-2.5-vl-72b-instruct:free',
+  cheap: process.env.VISION_CHEAP_MODEL || 'google/gemini-2.5-flash-lite',
+  strong: process.env.VISION_STRONG_MODEL || 'google/gemini-2.5-flash',
 };
 
 const MISTRAL_MODELS = {
@@ -21,7 +28,7 @@ const MISTRAL_MODELS = {
   strong: process.env.VISION_STRONG_MODEL || 'mistral-medium-latest',
 };
 
-const MODELS = IS_GROQ ? GROQ_MODELS : MISTRAL_MODELS;
+const MODELS = IS_OPENROUTER ? OPENROUTER_MODELS : (IS_GROQ ? GROQ_MODELS : MISTRAL_MODELS);
 
 /** Approx USD pricing used for session cost logs (not billing truth). */
 const PRICING = IS_GROQ
@@ -37,7 +44,11 @@ const PRICING = IS_GROQ
         chatOutput: 0.6 / 1_000_000,
       },
     }
-  : {
+  : IS_OPENROUTER ? {
+      ocrPerPage: 0,
+      cheap: { chatInput: 0, chatOutput: 0 },
+      strong: { chatInput: 0, chatOutput: 0 },
+    } : {
       ocrPerPage: 4 / 1000,
       cheap: {
         chatInput: 0.2 / 1_000_000,
@@ -126,6 +137,7 @@ function heuristicPageType(ocrMarkdown) {
 export {
   PROVIDER,
   IS_GROQ,
+  IS_OPENROUTER,
   MODELS,
   PRICING,
   USD_TO_NGN,

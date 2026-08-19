@@ -17,8 +17,8 @@ const GROQ_MODELS = {
 };
 
 const OPENROUTER_MODELS = {
-  ocr: process.env.VISION_OCR_MODEL || 'qwen/qwen-2.5-vl-72b-instruct:free',
-  cheap: process.env.VISION_CHEAP_MODEL || 'google/gemini-2.5-flash-lite',
+  ocr: process.env.VISION_OCR_MODEL || 'google/gemini-2.5-flash',
+  cheap: process.env.VISION_CHEAP_MODEL || 'google/gemini-2.5-flash',
   strong: process.env.VISION_STRONG_MODEL || 'google/gemini-2.5-flash',
 };
 

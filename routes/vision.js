@@ -122,15 +122,34 @@ router.post('/sessions/:id/pages', upload.array('images', 200), async (req, res)
     const items = addPagesFromImages(session, imageFiles);
     await materializeImagePages(session, items);
 
-    session.status = 'processing';
+    // Don't start processing yet — wait for client to call /start after all chunks uploaded
+    session.status = 'uploading';
     saveSession(session);
-    console.log(`[vision] ${imageFiles.length} image(s) queued for ${session.id}`);
-    kickoffSession(session.id);
+    console.log(`[vision] ${imageFiles.length} image(s) queued for ${session.id} (total: ${session.pages.length})`);
 
     res.json(publicSession(getSession(session.id)));
   } catch (err) {
     console.error('[vision] add pages failed:', err);
     res.status(500).json({ error: err.message || 'Failed to add pages' });
+  }
+});
+
+// ── Start processing (called after all pages are uploaded) ───────────────────
+router.post('/sessions/:id/start', (req, res) => {
+  try {
+    const session = getSession(req.params.id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (!session.pages.length) return res.status(400).json({ error: 'No pages to process' });
+
+    session.status = 'processing';
+    saveSession(session);
+    console.log(`[vision] starting processing for ${session.id} — ${session.pages.length} pages`);
+    kickoffSession(session.id);
+
+    res.json(publicSession(session));
+  } catch (err) {
+    console.error('[vision] start session failed:', err);
+    res.status(500).json({ error: err.message || 'Failed to start session' });
   }
 });
 

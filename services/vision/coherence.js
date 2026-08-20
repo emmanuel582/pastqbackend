@@ -79,11 +79,14 @@ function auditExtractedQuestions(extracted, { pageNum = '?' } = {}) {
     if (looksLikeOrphanFragment(stem) && !q.isContinuation) {
       reasons.push('orphan_leading_fragment');
     }
-    if (modal >= 3 && opts >= modal + 2) {
-      reasons.push(`option_count_${opts}_vs_modal_${modal}`);
-    }
-    // Too few options vs the page norm (e.g. 3 when everyone else has 5)
-    if (modal >= 4 && opts >= 1 && opts <= modal - 2 && !q.isContinuation && !q.incomplete) {
+    // ANY deviation from the page's modal option count (4 vs 5 is as dangerous as 3 vs 5)
+    if (
+      modal >= 3 &&
+      opts >= 1 &&
+      opts !== modal &&
+      !q.isContinuation &&
+      !q.incomplete
+    ) {
       reasons.push(`option_count_${opts}_vs_modal_${modal}`);
     }
     if (opts > 6) {

@@ -28,7 +28,37 @@ import {
   isExplanationLikeQuestion,
 } from './models.js';
 import { normalizeQuestionMath } from './mathNormalize.js';
-import { auditExtractedQuestions } from './coherence.js';
+import { auditExtractedQuestions, optionCount } from './coherence.js';
+
+/** After escalate: keep the version with more non-empty options when Q# matches. */
+function mergePreferRicherOptions(cheapQs, strongQs) {
+  const byNum = new Map();
+  for (const q of cheapQs || []) {
+    if (q?.questionNumber != null) byNum.set(Number(q.questionNumber), q);
+  }
+  return (strongQs || []).map((sq) => {
+    const n = sq?.questionNumber != null ? Number(sq.questionNumber) : null;
+    if (n == null || !byNum.has(n)) return sq;
+    const cq = byNum.get(n);
+    const so = optionCount(sq);
+    const co = optionCount(cq);
+    if (co > so) {
+      console.log(
+        `[escalate:merge] Q${n}: keeping cheap options (${co}) over strong (${so})`
+      );
+      return {
+        ...sq,
+        options: cq.options,
+        question: String(sq.question || '').trim().length >= String(cq.question || '').trim().length
+          ? sq.question
+          : cq.question,
+        needsReview: true,
+        confidence: Math.min(sq.confidence ?? 1, cq.confidence ?? 1, 0.55),
+      };
+    }
+    return sq;
+  });
+}
 
 function resolvePageDataUrl(dataUrl, imagePath) {
   if (dataUrl && String(dataUrl).startsWith('data:')) return dataUrl;
@@ -325,43 +355,61 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
   const stage = model === MODELS.strong ? 'strong' : 'cheap';
   const chatProvider = IS_HYBRID ? providerForStage(stage) : PROVIDER;
   const wantsStrong = model === MODELS.strong || stage === 'strong';
+  const isEscalate = String(label).includes('escalate') || wantsStrong;
 
   if (chatProvider === 'openrouter') {
     if (openRouterUnavailable) {
       console.warn(
-        `[vision] OpenRouter unavailable; using ${STRONG_FALLBACK_MODEL} for ${label}`
+        `[escalate:call] OpenRouter unavailable → will use ${STRONG_FALLBACK_MODEL} for ${label}`
       );
     } else if (process.env.OPENROUTER_API_KEY) {
       try {
+        console.log(
+          `[escalate:call] request → provider=openrouter model=${model} label=${label}`
+        );
+        const t0 = Date.now();
         const response = await withRetry(
           async () => openrouterProvider.chatJson(system, user, { maxTokens, model }),
           { label: `${label}:${model}`, retries: 1 }
+        );
+        console.log(
+          `[escalate:call] response ← provider=openrouter model=${response.model || model} ms=${Date.now() - t0} in=${response.usage?.promptTokens || 0} out=${response.usage?.completionTokens || 0}`
         );
         return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
       } catch (err) {
         if (isOpenRouterAuthError(err)) {
           openRouterUnavailable = true;
           console.warn(
-            `[vision] OpenRouter auth failed (${err.message}); escalationProvider=${STRONG_FALLBACK_MODEL} (openrouter unavailable)`
+            `[escalate:call] OpenRouter AUTH FAILED (${err.message}) → fallback ${STRONG_FALLBACK_MODEL}`
           );
         } else {
-          console.warn(`[vision] OpenRouter chat failed (${err.message}), falling back to Mistral`);
+          console.warn(
+            `[escalate:call] OpenRouter FAILED (${err.message}) → fallback Mistral`
+          );
         }
       }
     } else {
       openRouterUnavailable = true;
       console.warn(
-        `[vision] OPENROUTER_API_KEY not configured; escalationProvider=${STRONG_FALLBACK_MODEL} (openrouter unavailable)`
+        `[escalate:call] OPENROUTER_API_KEY missing → fallback ${STRONG_FALLBACK_MODEL}`
       );
     }
   }
   if (chatProvider === 'groq') {
     if (process.env.GROQ_API_KEY) {
       try {
+        if (isEscalate) {
+          console.log(`[escalate:call] request → provider=groq model=${model} label=${label}`);
+        }
         const response = await withRetry(
           async () => groqProvider.chatJson(system, user, { maxTokens, model }),
           { label: `${label}:${model}`, retries: 1 }
         );
+        if (isEscalate) {
+          console.log(
+            `[escalate:call] response ← provider=groq model=${response.model || model}`
+          );
+        }
         return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
       } catch (err) {
         console.warn(`[vision] Groq chat failed (${err.message}), falling back to Mistral`);
@@ -380,6 +428,12 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
   } else {
     fallbackModel = 'mistral-small-latest';
   }
+  if (isEscalate || wantsStrong) {
+    console.log(
+      `[escalate:call] request → provider=mistral model=${fallbackModel} label=${label}`
+    );
+  }
+  const t1 = Date.now();
   const response = await withRetry(
     async () =>
       mistral.chat.complete({
@@ -395,7 +449,19 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
     { label: `${label}:${fallbackModel}` }
   );
   const content = response.choices?.[0]?.message?.content;
-  return { data: parseJsonContent(content), usage: response.usage, model: fallbackModel };
+  if (isEscalate || wantsStrong) {
+    console.log(
+      `[escalate:call] response ← provider=mistral model=${fallbackModel} ms=${Date.now() - t1} in=${response.usage?.promptTokens || response.usage?.prompt_tokens || 0} out=${response.usage?.completionTokens || response.usage?.completion_tokens || 0}`
+    );
+  }
+  return {
+    data: parseJsonContent(content),
+    usage: {
+      promptTokens: response.usage?.promptTokens || response.usage?.prompt_tokens || 0,
+      completionTokens: response.usage?.completionTokens || response.usage?.completion_tokens || 0,
+    },
+    model: fallbackModel,
+  };
 }
 
 // ── Question Grouping and Ordering ──────────────────────────────────────────
@@ -967,11 +1033,11 @@ function stitchContinuation(session, pageIndex, extracted) {
 
 // ── Per-Page Execution ──────────────────────────────────────────────────────
 
-async function extractQuestions(ocrMarkdown, memory, subjectHint, model = MODELS.cheap) {
+async function extractQuestions(ocrMarkdown, memory, subjectHint, model = MODELS.cheap, label = 'extract') {
   const { data, usage, model: used } = await chatJson(
     EXTRACT_PROMPT,
-    `${buildMemoryBlock(memory)}\nContext subject: ${subjectHint || 'Deduce from content'}\n\nFormat all mathematical, physical, and chemical formulas in standard LaTeX ($...$). Discard background noise from adjacent pages.\nCRITICAL: Discard any leading/trailing crop fragments that have no visible question number. Never attach orphan option text to a different question number.\n\n--- OCR TRANSCRIPTION ---\n${ocrMarkdown.slice(0, 14000)}\n--- END ---`,
-    { maxTokens: 8192, model, label: 'extract' }
+    `${buildMemoryBlock(memory)}\nContext subject: ${subjectHint || 'Deduce from content'}\n\nFormat all mathematical, physical, and chemical formulas in standard LaTeX ($...$). Discard background noise from adjacent pages.\nCRITICAL: Discard any leading/trailing crop fragments that have no visible question number. Never attach orphan option text to a different question number.\nEvery MCQ must include ALL lettered options visible for that question (typically A–E). Do not drop an option because of diagonal wrap.\n\n--- OCR TRANSCRIPTION ---\n${ocrMarkdown.slice(0, 14000)}\n--- END ---`,
+    { maxTokens: 8192, model, label }
   );
   return { data, usage, model: used };
 }
@@ -1260,17 +1326,45 @@ async function executePageExtraction(
     // Selective escalation
     let modelPath = 'cheap';
     let escalateReason = null;
+    const cheapSnapshot = extracted
+      ? {
+          questions: Array.isArray(extracted.questions)
+            ? extracted.questions.map((q) => ({ ...q, options: [...(q.options || [])] }))
+            : [],
+        }
+      : null;
     const gate = needsStrongExtract(md, { ...pageMeta, pageType }, extracted);
     const wantStrong = gate.yes || coherence.shouldEscalate;
     if (wantStrong) {
       escalateReason = gate.yes
         ? gate.reason
-        : `coherence:${(coherence.flags || []).map((f) => f.action).join('+') || 'fail'}`;
-      console.log(`[escalate] Page ${pageNum}: Escalating due to "${escalateReason}"`);
+        : `coherence:${(coherence.flags || []).map((f) => `${f.action}:${(f.reasons || []).join('|')}`).join(';') || 'fail'}`;
+      console.log(
+        `[escalate] Page ${pageNum}: START reason="${escalateReason}" targetModel=${MODELS.strong} cheapQuestions=${extracted?.questions?.length || 0}`
+      );
       modelPath = 'strong';
-      const strong = await extractQuestions(md, memory, effectiveSubjectHint, MODELS.strong);
-      trackCost({ usage: strong.usage, model: strong.model });
-      extracted = strong.data;
+      try {
+        const strong = await extractQuestions(
+          md,
+          memory,
+          effectiveSubjectHint,
+          MODELS.strong,
+          'escalate-extract'
+        );
+        trackCost({ usage: strong.usage, model: strong.model });
+        console.log(
+          `[escalate] Page ${pageNum}: GOT model=${strong.model} questions=${strong.data?.questions?.length ?? 0}`
+        );
+        extracted = strong.data;
+      } catch (escErr) {
+        console.error(
+          `[escalate] Page ${pageNum}: FAILED (${escErr?.message || escErr}) — keeping cheap extract`
+        );
+        extracted = cheapSnapshot
+          ? { ...(extracted || {}), questions: cheapSnapshot.questions }
+          : extracted;
+        modelPath = 'cheap';
+      }
       // Re-apply header override after strong extract
       if (extracted) {
         const re = applyDetectedHeader(extracted.pageMeta || pageMeta, md);
@@ -1288,8 +1382,18 @@ async function executePageExtraction(
         extracted.questions = extracted.questions
           .filter((q) => !isExplanationLikeQuestion(q))
           .map(normalizeQuestionMath);
+        // Prefer fuller option sets from cheap when strong loses options
+        if (cheapSnapshot?.questions?.length) {
+          extracted.questions = mergePreferRicherOptions(
+            cheapSnapshot.questions,
+            extracted.questions
+          );
+        }
         coherence = auditExtractedQuestions(extracted, { pageNum });
         extracted.questions = coherence.questions;
+        console.log(
+          `[escalate] Page ${pageNum}: AFTER coherence kept=${extracted.questions.length} flags=${coherence.flags.length} missing=[${(coherence.missing || []).join(',')}]`
+        );
       }
       if (pageType === 'explanation' || pageType === 'blank' || pageType === 'cover_toc') {
         console.log(`[vision:skip] Page ${pageNum} reclassified after escalate as ${pageType}`);
@@ -1314,6 +1418,16 @@ async function executePageExtraction(
         type: 'missing_question_numbers',
         message: `Page ${pageNum}: question number(s) ${coherence.missing.join(', ')} missing or dropped after coherence checks. Re-snap that region if needed.`,
         meta: { pageIndex, missing: coherence.missing },
+      });
+    }
+    const shortOpts = (coherence.flags || []).filter((f) =>
+      (f.reasons || []).some((r) => String(r).startsWith('option_count_'))
+    );
+    if (shortOpts.length) {
+      followUps.push({
+        type: 'option_count_mismatch',
+        message: `Page ${pageNum}: option count differs from page modal for Q${shortOpts.map((f) => f.questionNumber).filter((n) => n != null).join(', Q')}. Review those questions.`,
+        meta: { pageIndex, flags: shortOpts },
       });
     }
 

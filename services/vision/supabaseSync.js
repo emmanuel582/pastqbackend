@@ -34,9 +34,12 @@ function getSupabase() {
   return _supabase;
 }
 
+const unknownColumns = new Set();
+
 /**
  * Sync a session's extracted data to Supabase `library_bundles`.
  * Called progressively after each page completes — users see questions appearing in real-time.
+ * Dynamically adapts to whatever schema columns exist in the database.
  *
  * @param {Object} session - The full session object from store
  * @returns {Promise<{synced: boolean, error?: string}>}
@@ -46,32 +49,59 @@ async function syncSessionToSupabase(session) {
   if (!supabase) return { synced: false, error: 'Supabase not configured' };
 
   try {
-    const bundle = {
+    const payload = {
       id: session.id,
       title: session.name || 'Untitled Material',
+      name: session.name || 'Untitled Material',
       icon: session.icon || '📖',
       status: session.status || 'processing',
       questions: session.questions || [],
       groups: session.groups || [],
+      subject: session.memory?.activeSubject || session.subjectHint || null,
+      question_count: (session.questions || []).length,
+      cost: session.cost || null,
+      progress: session.progress || null,
+      follow_ups: (session.followUps || []).filter((f) => f.status !== 'resolved'),
+      answer_key_count: (session.answerKeys || []).length,
       created_at: session.createdAt ? new Date(session.createdAt).toISOString() : new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
 
-    const { error } = await supabase
-      .from('library_bundles')
-      .upsert(bundle, { onConflict: 'id' });
+    for (const col of unknownColumns) {
+      delete payload[col];
+    }
 
-    if (error) {
+    let attempts = 0;
+    while (attempts < 15) {
+      attempts++;
+      const { error } = await supabase
+        .from('library_bundles')
+        .upsert(payload, { onConflict: 'id' });
+
+      if (!error) {
+        return { synced: true };
+      }
+
       // If table doesn't exist, log once and continue — don't crash the pipeline
       if (error.code === '42P01' || error.message?.includes('does not exist')) {
         console.warn('[supabase-sync] library_bundles table does not exist — run migration first');
         return { synced: false, error: 'Table not found' };
       }
+
+      // Adaptively detect columns that do not exist in the database schema cache
+      const missingColMatch = error.message?.match(/Could not find the '([^']+)' column/i);
+      if (missingColMatch && missingColMatch[1] && payload.hasOwnProperty(missingColMatch[1])) {
+        const col = missingColMatch[1];
+        unknownColumns.add(col);
+        delete payload[col];
+        continue;
+      }
+
       console.error('[supabase-sync] upsert failed:', error.message);
       return { synced: false, error: error.message };
     }
 
-    return { synced: true };
+    return { synced: false, error: 'Max schema fallback attempts reached' };
   } catch (err) {
     console.error('[supabase-sync] unexpected error:', err.message || err);
     return { synced: false, error: err.message || String(err) };

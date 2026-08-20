@@ -1,13 +1,4 @@
-/**
- * Cost/quality routing for PastQ vision.
- *
- * Default path (hybrid):
- *   OCR              → Mistral OCR ($0.004/page — purpose-built, highest accuracy)
- *   Classify/Extract → Mistral Small ($0.15/$0.60 per 1M tokens — cheapest quality JSON)
- *   Strong escalate  → Gemini 2.5 Flash via OpenRouter ($0.30/$2.50 — only ~10% of pages)
- *
- * Providers: hybrid (default) | groq | openrouter | mistral
- */
+
 const PROVIDER = (process.env.VISION_PROVIDER || 'hybrid').toLowerCase();
 const IS_GROQ = PROVIDER === 'groq';
 const IS_OPENROUTER = PROVIDER === 'openrouter';

@@ -24,6 +24,8 @@ import {
   rebuildGroups,
   applyAnswerKeys,
   MAX_RETRIES,
+  abortSession,
+  abortAllSessions,
  } from '../services/vision/processor.js';
 
 const upload = multer({
@@ -93,6 +95,18 @@ router.get('/sessions/:id', (req, res) => {
 });
 
 router.delete('/sessions/:id', (req, res) => {
+  abortSession(req.params.id);
+  deleteSession(req.params.id);
+  const jobs = getJobs();
+  if (jobs[req.params.id]) {
+    delete jobs[req.params.id];
+    saveJobs(jobs);
+  }
+  res.json({ success: true });
+});
+
+router.post('/sessions/:id/cancel', (req, res) => {
+  abortSession(req.params.id);
   deleteSession(req.params.id);
   const jobs = getJobs();
   if (jobs[req.params.id]) {
@@ -103,6 +117,7 @@ router.delete('/sessions/:id', (req, res) => {
 });
 
 router.delete('/sessions', (_req, res) => {
+  abortAllSessions();
   const sessions = listSessions();
   for (const s of sessions) {
     deleteSession(s.id);

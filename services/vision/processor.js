@@ -26,6 +26,21 @@ import {
 
 const MAX_RETRIES = 4;
 const activeWorkers = new Set();
+const abortedSessions = new Set();
+
+function abortSession(sessionId) {
+  abortedSessions.add(sessionId);
+  activeWorkers.delete(sessionId);
+  console.log(`[vision] Session ${sessionId} cancelled/aborted`);
+}
+
+function abortAllSessions() {
+  for (const id of activeWorkers) {
+    abortedSessions.add(id);
+  }
+  activeWorkers.clear();
+  console.log('[vision] All active sessions cancelled/aborted');
+}
 
 function getMistral() {
   return new Mistral({ apiKey: process.env.MISTRAL_API_KEY });
@@ -907,6 +922,10 @@ async function runSessionWorker(sessionId) {
     let circuitBroken = false;
 
     while (true) {
+      if (abortedSessions.has(sessionId)) {
+        console.log(`[vision] Session ${sessionId} was aborted, stopping worker.`);
+        return;
+      }
       session = getSession(sessionId);
       if (!session) break;
 
@@ -928,12 +947,15 @@ async function runSessionWorker(sessionId) {
 
       const batch = pendingPages.slice(0, CONCURRENCY);
       const promises = batch.map(async (page) => {
+        if (abortedSessions.has(sessionId)) return;
         await sem.acquire();
         try {
+          if (abortedSessions.has(sessionId)) return;
           const freshSession = getSession(sessionId);
-          if (!freshSession) return;
+          if (!freshSession || abortedSessions.has(sessionId)) return;
 
           await processOnePage(freshSession, page);
+          if (abortedSessions.has(sessionId)) return;
           consecutiveFailures = 0;
 
           trimMemory(freshSession);
@@ -1068,4 +1090,6 @@ export {
   addCost,
   deduplicateQuestions,
   validateQuestionSequence,
+  abortSession,
+  abortAllSessions,
 };

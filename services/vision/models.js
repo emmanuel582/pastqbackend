@@ -104,7 +104,7 @@ const IMAGE_PREP = {
   jpegQuality: Number(process.env.VISION_JPEG_QUALITY || 90),
 };
 
-const CONCURRENCY = Number(process.env.VISION_CONCURRENCY || 5);
+const CONCURRENCY = Number(process.env.VISION_CONCURRENCY || 2);
 const CIRCUIT_BREAKER_THRESHOLD = Number(process.env.VISION_CIRCUIT_BREAKER || 5);
 
 function pricingForModel(model) {

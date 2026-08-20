@@ -76,34 +76,34 @@ function providerForStage(stage) {
 /** Approx USD pricing used for session cost logs */
 const PRICING = IS_GROQ
   ? {
-      ocrPerPage: 0.002,
-      cheap: {
-        chatInput: 0.075 / 1_000_000,
-        chatOutput: 0.3 / 1_000_000,
-      },
-      strong: {
-        chatInput: 0.15 / 1_000_000,
-        chatOutput: 0.6 / 1_000_000,
-      },
-    }
+    ocrPerPage: 0.002,
+    cheap: {
+      chatInput: 0.075 / 1_000_000,
+      chatOutput: 0.3 / 1_000_000,
+    },
+    strong: {
+      chatInput: 0.15 / 1_000_000,
+      chatOutput: 0.6 / 1_000_000,
+    },
+  }
   : IS_OPENROUTER ? {
-      ocrPerPage: 0,
-      cheap: { chatInput: 0.3 / 1_000_000, chatOutput: 2.5 / 1_000_000 },
-      strong: { chatInput: 0.3 / 1_000_000, chatOutput: 2.5 / 1_000_000 },
+    ocrPerPage: 0,
+    cheap: { chatInput: 0.3 / 1_000_000, chatOutput: 2.5 / 1_000_000 },
+    strong: { chatInput: 0.3 / 1_000_000, chatOutput: 2.5 / 1_000_000 },
+  } : {
+    ocrPerPage: 4 / 1000,      // $0.004/page
+    cheap: {
+      chatInput: 0.15 / 1_000_000,    // Mistral Small
+      chatOutput: 0.6 / 1_000_000,
+    },
+    strong: IS_HYBRID ? {
+      chatInput: 0.3 / 1_000_000,     // Gemini Flash via OpenRouter
+      chatOutput: 2.5 / 1_000_000,
     } : {
-      ocrPerPage: 4 / 1000,      // $0.004/page
-      cheap: {
-        chatInput: 0.15 / 1_000_000,    // Mistral Small
-        chatOutput: 0.6 / 1_000_000,
-      },
-      strong: IS_HYBRID ? {
-        chatInput: 0.3 / 1_000_000,     // Gemini Flash via OpenRouter
-        chatOutput: 2.5 / 1_000_000,
-      } : {
-        chatInput: 1.5 / 1_000_000,     // Mistral Medium
-        chatOutput: 7.5 / 1_000_000,
-      },
-    };
+      chatInput: 1.5 / 1_000_000,     // Mistral Medium
+      chatOutput: 7.5 / 1_000_000,
+    },
+  };
 
 const USD_TO_NGN = Number(process.env.USD_TO_NGN || 1400);
 

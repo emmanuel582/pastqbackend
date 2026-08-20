@@ -16,9 +16,11 @@ function getSupabase() {
   if (_supabase) return _supabase;
 
   const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-  // Prefer service key for server-side writes; fall back to anon key
+  // Prefer service role key for server-side writes (bypasses RLS); fall back to anon key
   const key =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
     process.env.SUPABASE_SERVICE_KEY ||
+    process.env.SERVICE_ROLE_KEY ||
     process.env.SUPABASE_ANON_KEY ||
     process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 

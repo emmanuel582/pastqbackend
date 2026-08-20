@@ -6,6 +6,7 @@ import visionRoutes from './routes/vision.js';
 import { PROVIDER, MODELS } from './services/vision/models.js';
 import { listSessions } from './services/vision/store.js';
 import { syncAllPendingSessions } from './services/vision/supabaseSync.js';
+import { openRouterKeyFingerprint } from './services/vision/openrouterProvider.js';
 
 dotenv.config();
 
@@ -81,7 +82,8 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`PastQ backend listening on 0.0.0.0:${PORT}`);
   console.log(`[vision] provider=${PROVIDER} ocr=${MODELS.ocr} cheap=${MODELS.cheap} strong=${MODELS.strong}`);
-  
+  console.log(`[vision] OPENROUTER_API_KEY=${openRouterKeyFingerprint()}`);
+
   // Sync completed sessions to Supabase on startup so all users can see them
   syncAllPendingSessions(listSessions).catch((err) => {
     console.warn('[supabase-sync] startup sync error:', err.message);

@@ -1,9 +1,24 @@
 import sharp from 'sharp';
 
 function getApiKey() {
-  const apiKey = process.env.OPENROUTER_API_KEY;
+  let apiKey = process.env.OPENROUTER_API_KEY;
+  if (typeof apiKey === 'string') {
+    apiKey = apiKey.trim().replace(/^["']|["']$/g, '');
+  }
   if (!apiKey) throw new Error('OPENROUTER_API_KEY is not set');
+  if (!apiKey.startsWith('sk-or-')) {
+    throw new Error('OPENROUTER_API_KEY looks invalid (expected sk-or-… prefix)');
+  }
   return apiKey;
+}
+
+export function openRouterKeyFingerprint() {
+  try {
+    const k = getApiKey();
+    return `${k.slice(0, 10)}…${k.slice(-4)} (len=${k.length})`;
+  } catch {
+    return 'MISSING';
+  }
 }
 
 const OCR_PROMPT = `You are a precise OCR engine for exam past-question pages.

@@ -145,11 +145,137 @@ function needsStrongExtract(ocrMarkdown, classified, extracted) {
   return { yes: false, reason: null };
 }
 
-/** Skip LLM entirely only for genuinely blank pages. */
+/**
+ * Structural page-type heuristic (content shape, not just "has numbers").
+ * Used to skip blank/explanation pages early and to override weak LLM labels.
+ */
 function heuristicPageType(ocrMarkdown) {
   const text = (ocrMarkdown || '').trim();
-  if (text.length < 20) return { pageType: 'blank', confidence: 0.98, reason: 'blank_or_negligible_text' };
+  if (text.length < 20) {
+    return { pageType: 'blank', confidence: 0.98, reason: 'blank_or_negligible_text' };
+  }
+
+  const optionHits = (text.match(/(?:^|\n)\s*[A-Ea-e][.)]\s+\S/gm) || []).length;
+  const numbered = (text.match(/(?:^|\n)\s*\d{1,3}[.)]\s+\S/gm) || []).length;
+  const shortKeyHits = (text.match(/(?:^|\n)\s*\d{1,3}[.)]\s*[A-Ea-e]\b/gim) || []).length;
+  const interrogatives = (
+    text.match(
+      /\?|(?:^|\n)\s*(?:which|what|when|where|who|whom|whose|how|calculate|find|determine|the following|identify)\b/gim
+    ) || []
+  ).length;
+  const explainCueHits = (
+    text.match(
+      /\b(?:because|therefore|hence|this (?:is|means)|implies that|correct (?:option|answer)|as explained|solution:|explanations?\s+to)\b/gi
+    ) || []
+  ).length;
+
+  // Explicit solutions / explanations sections (e.g. "Explanations to the Answers")
+  if (
+    /explanations?\s+to\s+(the\s+)?answers?/i.test(text) ||
+    /worked\s+solutions?/i.test(text) ||
+    /solutions?\s+to\s+(the\s+)?(questions?|answers?|test|paper)/i.test(text) ||
+    /answer\s+explanations?/i.test(text) ||
+    /(?:^|\n)\s*explanations?\s*(?:\n|$)/i.test(text)
+  ) {
+    return {
+      pageType: 'explanation',
+      confidence: 0.96,
+      reason: 'explanation_section_header',
+    };
+  }
+
+  // Compact marking scheme: "1. A  2. B  3. C" — not MCQ stems
+  if (shortKeyHits >= 8 && optionHits <= 3 && interrogatives <= 2) {
+    return {
+      pageType: 'answer_key',
+      confidence: 0.93,
+      reason: 'compact_answer_key_pattern',
+    };
+  }
+
+  // Numbered prose commentary without MCQ options / question stems
+  if (
+    numbered >= 5 &&
+    optionHits <= 2 &&
+    interrogatives <= 2 &&
+    explainCueHits >= 3 &&
+    text.length > 350
+  ) {
+    return {
+      pageType: 'explanation',
+      confidence: 0.9,
+      reason: 'numbered_explanation_prose',
+    };
+  }
+
   return null;
+}
+
+/**
+ * Override LLM pageType when OCR structure clearly disagrees
+ * (e.g. model says question_content on an explanations page).
+ */
+function refinePageType(ocrMarkdown, pageMeta, extracted) {
+  const heuristic = heuristicPageType(ocrMarkdown);
+  const modelType = pageMeta?.pageType || null;
+  const qs = Array.isArray(extracted?.questions) ? extracted.questions : [];
+
+  if (heuristic?.pageType === 'explanation') {
+    return {
+      pageType: 'explanation',
+      confidence: Math.max(pageMeta?.confidence ?? 0, heuristic.confidence),
+      reason: heuristic.reason,
+      dropQuestions: true,
+    };
+  }
+
+  if (heuristic?.pageType === 'answer_key' && modelType !== 'answer_key') {
+    return {
+      pageType: 'answer_key',
+      confidence: heuristic.confidence,
+      reason: heuristic.reason,
+      dropQuestions: true,
+    };
+  }
+
+  // Model said question_content but extracted "questions" look like commentary
+  if (modelType === 'question_content' && qs.length > 0) {
+    const fake = qs.filter(isExplanationLikeQuestion);
+    if (fake.length >= Math.ceil(qs.length * 0.6) && fake.length >= 3) {
+      return {
+        pageType: 'explanation',
+        confidence: 0.88,
+        reason: 'extracted_items_look_like_explanations',
+        dropQuestions: true,
+      };
+    }
+  }
+
+  return {
+    pageType: modelType || (qs.length > 0 ? 'question_content' : 'blank'),
+    confidence: pageMeta?.confidence ?? 0.9,
+    reason: null,
+    dropQuestions: false,
+  };
+}
+
+/** True when an extracted item is answer commentary, not an MCQ stem. */
+function isExplanationLikeQuestion(q) {
+  const stem = String(q?.question || '').trim();
+  const opts = Array.isArray(q?.options) ? q.options.filter((o) => String(o || '').trim()) : [];
+  if (opts.length >= 2) return false;
+  if (!stem) return true;
+  if (
+    /^(the\s+)?(correct\s+)?(option|answer)\b/i.test(stem) ||
+    /\b(this is because|therefore|hence|as explained|the solution)\b/i.test(stem)
+  ) {
+    return true;
+  }
+  // Long prose, no question mark, no options → commentary
+  if (opts.length === 0 && !stem.includes('?') && stem.length > 100) {
+    return true;
+  }
+  return false;
 }
 
 export {
@@ -169,4 +295,6 @@ export {
   providerForStage,
   needsStrongExtract,
   heuristicPageType,
+  refinePageType,
+  isExplanationLikeQuestion,
 };

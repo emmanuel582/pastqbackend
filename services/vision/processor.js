@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { Mistral } from '@mistralai/mistralai';
 import * as groqProvider from './groq.js';
 import * as openrouterProvider from './openrouterProvider.js';
@@ -23,7 +24,79 @@ import {
   providerForStage,
   needsStrongExtract,
   heuristicPageType,
+  refinePageType,
+  isExplanationLikeQuestion,
 } from './models.js';
+import { normalizeQuestionMath } from './mathNormalize.js';
+
+function resolvePageDataUrl(dataUrl, imagePath) {
+  if (dataUrl && String(dataUrl).startsWith('data:')) return dataUrl;
+  if (imagePath && fs.existsSync(imagePath)) {
+    const buf = fs.readFileSync(imagePath);
+    return `data:image/jpeg;base64,${buf.toString('base64')}`;
+  }
+  return null;
+}
+
+/**
+ * Ensure page has OCR markdown. Image uploads store dataUrl/imagePath but historically
+ * skipped OCR before extract — which caused false "blank page" skips.
+ */
+async function ensurePageOcr(sessionId, pageRef) {
+  const pageNum = (pageRef?.index ?? 0) + 1;
+
+  const need = await withSessionLock(sessionId, (s) => {
+    const pg = s.pages.find((p) => p.id === pageRef.id) || s.pages[pageRef.index];
+    if (!pg) return null;
+    const existing = (pg.ocrMarkdown || '').trim();
+    if (existing.length >= 8) {
+      return { skip: true, ocrMarkdown: existing };
+    }
+    return {
+      skip: false,
+      dataUrl: pg.dataUrl || null,
+      imagePath: pg.imagePath || null,
+    };
+  });
+
+  if (!need) return '';
+  if (need.skip) return need.ocrMarkdown;
+
+  const url = resolvePageDataUrl(need.dataUrl, need.imagePath);
+  if (!url) {
+    console.warn(
+      `[vision:ocr] Page ${pageNum}: no image data available for OCR (empty markdown)`
+    );
+    return '';
+  }
+
+  console.log(`[vision:ocr] Page ${pageNum}: running OCR (${PROVIDER})...`);
+  const ocrResponse = await runOcrImage(url);
+  const pages = ocrResponse?.pages || [];
+  const md = String(pages[0]?.markdown || pages[0]?.text || '').trim();
+  const pagesProcessed =
+    ocrResponse?.usageInfo?.pagesProcessed ??
+    ocrResponse?.usage_info?.pages_processed ??
+    1;
+
+  await withSessionLock(sessionId, (s) => {
+    const pg = s.pages.find((p) => p.id === pageRef.id) || s.pages[pageRef.index];
+    if (!pg) return;
+    pg.ocrMarkdown = md;
+    // Drop in-memory dataUrl after OCR to free RAM; imagePath remains on disk
+    delete pg.dataUrl;
+    addCost(s, {
+      ocrPages: pagesProcessed,
+      usage: ocrResponse?.usage,
+      model: MODELS.ocr,
+    });
+  });
+
+  console.log(
+    `[vision:ocr] Page ${pageNum}: OCR complete — ${md.length} chars`
+  );
+  return md;
+}
 
 const MAX_RETRIES = 4;
 const activeWorkers = new Set();
@@ -194,7 +267,7 @@ async function runOcrImage(dataUrl) {
     }
   }
   const mistral = getMistral();
-  return withRetry(
+  const mistralResult = await withRetry(
     async () =>
       mistral.ocr.process({
         model: 'mistral-ocr-latest',
@@ -202,6 +275,23 @@ async function runOcrImage(dataUrl) {
       }),
     { label: 'mistral-ocr-image' }
   );
+
+  const md = String(mistralResult?.pages?.[0]?.markdown || '').trim();
+  // Hybrid: if Mistral OCR returns empty, escalate to OpenRouter vision OCR
+  if (IS_HYBRID && md.length < 8 && process.env.OPENROUTER_API_KEY && !openRouterUnavailable) {
+    try {
+      console.warn('[vision] Mistral OCR returned empty; retrying with OpenRouter vision OCR');
+      return await withRetry(
+        async () => openrouterProvider.ocrImage(dataUrl, { model: MODELS.strong }),
+        { label: 'openrouter-ocr-fallback', retries: 1 }
+      );
+    } catch (err) {
+      if (isOpenRouterAuthError(err)) openRouterUnavailable = true;
+      console.warn(`[vision] OpenRouter OCR fallback failed (${err.message}); keeping Mistral result`);
+    }
+  }
+
+  return mistralResult;
 }
 
 async function runOcrPdf(dataUrl) {
@@ -831,6 +921,7 @@ function stitchContinuation(session, pageIndex, extracted) {
       needsReview: Boolean(raw.needsReview) || options.length < 2,
       incomplete: Boolean(raw.incomplete),
     };
+    normalizeQuestionMath(q);
 
     autoAssignMissing(session, q);
 
@@ -929,13 +1020,63 @@ async function executePageExtraction(
     }
 
     const heuristic = heuristicPageType(md);
-    if (heuristic) {
+    if (heuristic?.pageType === 'blank') {
       console.log(`[vision:heuristic] Page ${pageNum} skipped: ${heuristic.reason}`);
       return {
-        pageType: heuristic.pageType,
+        pageType: 'blank',
         classifyConfidence: heuristic.confidence,
         skipStatus: 'skipped',
         skipReason: heuristic.reason,
+        questionCount: 0,
+        costEntries: costAcc.entries,
+      };
+    }
+    // Explanations / solutions pages: skip before LLM so we don't mint fake MCQs
+    if (heuristic?.pageType === 'explanation') {
+      console.log(
+        `[vision:heuristic] Page ${pageNum} marked explanation (${heuristic.reason}) — skipping question extract`
+      );
+      return {
+        pageType: 'explanation',
+        classifyConfidence: heuristic.confidence,
+        skipStatus: 'skipped',
+        skipReason: heuristic.reason,
+        memoryUpdates: memory.answersSectionStarted ? {} : { answersSectionStarted: true },
+        questionCount: 0,
+        costEntries: costAcc.entries,
+      };
+    }
+
+    // Compact answer keys: go straight to answer-key extract (no MCQ pass)
+    if (heuristic?.pageType === 'answer_key') {
+      console.log(
+        `[vision:heuristic] Page ${pageNum} compact answer key (${heuristic.reason}) — answer-key path`
+      );
+      const memoryUpdates = { answersSectionStarted: true };
+      const header = detectExamHeader(md);
+      if (header?.year) memoryUpdates.activeYear = String(header.year);
+      if (header?.paper) memoryUpdates.activePaper = normalizePaper(header.paper) || header.paper;
+
+      console.log(`[vision:answers] Page ${pageNum}: Parsing answer keys (heuristic)...`);
+      const { data: answers, usage: aUsage, model: aModel } = await extractAnswerKey(md, memory);
+      trackCost({ usage: aUsage, model: aModel });
+      const year = header?.year || answers?.year || memory.activeYear || null;
+      const paper =
+        normalizePaper(header?.paper || answers?.paper || memory.activePaper) || null;
+      const answerKeys = (answers?.answers || []).map((a) => ({
+        questionNumber: a.questionNumber,
+        correctLetter: a.correctLetter,
+        correctIndex: a.correctIndex ?? letterToIndex(a.correctLetter),
+        year: year ? String(year) : null,
+        paper,
+        subject: answers?.subject || memory.activeSubject || null,
+      }));
+      return {
+        pageType: 'answer_key',
+        classifyConfidence: heuristic.confidence,
+        answerKeys,
+        memoryUpdates,
+        followUps: answers?.followUps || [],
         questionCount: 0,
         costEntries: costAcc.entries,
       };
@@ -970,9 +1111,29 @@ async function executePageExtraction(
       );
     }
 
-    const pageType =
-      pageMeta.pageType || (extracted?.questions?.length > 0 ? 'question_content' : 'blank');
-    const classifyConfidence = pageMeta.confidence ?? 0.9;
+    const refined = refinePageType(md, pageMeta, extracted);
+    let pageType = refined.pageType;
+    const classifyConfidence = refined.confidence ?? pageMeta.confidence ?? 0.9;
+    if (refined.reason && refined.pageType !== pageMeta.pageType) {
+      console.log(
+        `[vision:classify:override] Page ${pageNum}: model="${pageMeta.pageType}" → "${pageType}" (${refined.reason})`
+      );
+    }
+    if (refined.dropQuestions && extracted) {
+      extracted.questions = [];
+      extracted.openQuestionCarry = null;
+    } else if (extracted?.questions?.length) {
+      const before = extracted.questions.length;
+      extracted.questions = extracted.questions.filter((q) => !isExplanationLikeQuestion(q));
+      const dropped = before - extracted.questions.length;
+      if (dropped > 0) {
+        console.log(
+          `[vision:filter] Page ${pageNum}: dropped ${dropped} explanation-like item(s) from extract`
+        );
+      }
+      extracted.questions = extracted.questions.map(normalizeQuestionMath);
+    }
+    if (extracted?.pageMeta) extracted.pageMeta.pageType = pageType;
 
     console.log(
       `[vision:classify] Page ${pageNum}: type="${pageType}", confidence=${classifyConfidence}, year=${pageMeta.year || '?'}, paper=${pageMeta.paper || '?'}, subject=${pageMeta.subject || '?'}`
@@ -998,12 +1159,16 @@ async function executePageExtraction(
       ];
     }
 
-    if (pageType === 'blank' || pageType === 'cover_toc') {
+    if (pageType === 'blank' || pageType === 'cover_toc' || pageType === 'explanation') {
       console.log(`[vision:skip] Page ${pageNum} marked as ${pageType}, skipped.`);
+      if (pageType === 'explanation') {
+        memoryUpdates.answersSectionStarted = true;
+      }
       return {
         pageType,
         classifyConfidence,
         skipStatus: 'skipped',
+        skipReason: refined.reason || pageType,
         memoryUpdates,
         questionCount: 0,
         costEntries: costAcc.entries,
@@ -1087,7 +1252,7 @@ async function executePageExtraction(
     // Selective escalation
     let modelPath = 'cheap';
     let escalateReason = null;
-    const gate = needsStrongExtract(md, pageMeta, extracted);
+    const gate = needsStrongExtract(md, { ...pageMeta, pageType }, extracted);
     if (gate.yes) {
       console.log(`[escalate] Page ${pageNum}: Escalating due to "${gate.reason}"`);
       modelPath = 'strong';
@@ -1102,6 +1267,31 @@ async function executePageExtraction(
         pageMeta = re.pageMeta;
         if (re.detected?.year) memoryUpdates.activeYear = String(re.detected.year);
         if (re.detected?.paper) memoryUpdates.activePaper = re.detected.paper;
+      }
+      const reRefined = refinePageType(md, pageMeta, extracted);
+      pageType = reRefined.pageType;
+      if (reRefined.dropQuestions && extracted) {
+        extracted.questions = [];
+        extracted.openQuestionCarry = null;
+      } else if (extracted?.questions?.length) {
+        extracted.questions = extracted.questions
+          .filter((q) => !isExplanationLikeQuestion(q))
+          .map(normalizeQuestionMath);
+      }
+      if (pageType === 'explanation' || pageType === 'blank' || pageType === 'cover_toc') {
+        console.log(`[vision:skip] Page ${pageNum} reclassified after escalate as ${pageType}`);
+        if (pageType === 'explanation') memoryUpdates.answersSectionStarted = true;
+        return {
+          pageType,
+          classifyConfidence: reRefined.confidence,
+          skipStatus: 'skipped',
+          skipReason: reRefined.reason || pageType,
+          memoryUpdates,
+          questionCount: 0,
+          escalateReason,
+          modelPath,
+          costEntries: costAcc.entries,
+        };
       }
     }
 
@@ -1258,22 +1448,48 @@ async function runSessionWorker(sessionId) {
         try {
           if (abortedSessions.has(sessionId)) return;
 
+          // ── OCR image pages if markdown missing (PDF path OCRs earlier) ──
+          let ocrMarkdown = '';
+          try {
+            ocrMarkdown = await ensurePageOcr(sessionId, pageRef);
+          } catch (ocrErr) {
+            const msg = ocrErr?.message || String(ocrErr);
+            console.error(`[vision:ocr] Page ${pageRef.index + 1} OCR failed: ${msg}`);
+            await withSessionLock(sessionId, (s) => {
+              const pg = s.pages.find((p) => p.id === pageRef.id) || s.pages[pageRef.index];
+              if (!pg) return;
+              pg.retryCount = (pg.retryCount || 0) + 1;
+              pg.error = `OCR failed: ${msg}`;
+              pg.status = pg.retryCount <= MAX_RETRIES ? 'pending' : 'failed';
+              if (pg.status === 'failed') {
+                consecutiveFailures++;
+                if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) circuitBroken = true;
+              }
+              updateProgress(s);
+            });
+            return;
+          }
+
           // ── Read the memory snapshot & page data under lock ──────────
-          const { ocrMarkdown, pageIndex, subjectHint, memorySnapshot } =
+          const pageCtx =
             await withSessionLock(sessionId, (s) => {
               const pg = s.pages.find((p) => p.id === pageRef.id) || s.pages[pageRef.index];
               if (!pg) return null;
               pg.retryCount = pg.retryCount || 0;
               pg.modelPath = pg.modelPath || 'cheap';
+              // Prefer freshly written OCR; fall back to whatever was stored
+              const md = (ocrMarkdown || pg.ocrMarkdown || '').trim() || pg.ocrMarkdown || '';
               return {
-                ocrMarkdown: pg.ocrMarkdown || '',
+                ocrMarkdown: md,
                 pageIndex: pg.index,
                 subjectHint: s.memory?.activeSubject || s.subjectHint || null,
                 memorySnapshot: JSON.parse(JSON.stringify(s.memory || {})),
               };
-            }) || {};
+            });
 
-          if (ocrMarkdown === undefined) return; // page disappeared
+          if (!pageCtx) return; // page disappeared
+          const { pageIndex, subjectHint, memorySnapshot } = pageCtx;
+          ocrMarkdown = pageCtx.ocrMarkdown || '';
 
           // ── Execute the slow LLM call OUTSIDE the lock ────────────
           // This is the critical design: the API call takes seconds,

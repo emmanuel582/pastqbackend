@@ -16,7 +16,7 @@ Return JSON ONLY:
 {
   "reasoning": "Step-by-step reasoning explaining page classification, subject deduction, noise rejection, and any complex formatting decisions.",
   "pageMeta": {
-    "pageType": "question_content" | "answer_key" | "cover_toc" | "unclear" | "blank",
+    "pageType": "question_content" | "answer_key" | "explanation" | "cover_toc" | "unclear" | "blank",
     "year": string|null,
     "paper": string|null,
     "subject": string|null,
@@ -62,20 +62,23 @@ Return JSON ONLY:
 CRITICAL EXTRACTION & FORMATTING RULES:
 ═════════════════════════════════════════════════════════════════════════
 
-1. PAGE CLASSIFICATION (pageMeta.pageType):
-   - "question_content": Contains exam questions, MCQ stems, options, or problem continuations.
-   - "answer_key": Contains primarily marking keys/answers (e.g. "1. A, 2. B, 3. D") with minimal question stems.
+1. PAGE CLASSIFICATION (pageMeta.pageType) — JUDGE BY CONTENT STRUCTURE, NOT BY NUMBERED LISTS:
+   - "question_content": Has interrogative MCQ stems (Which/What/Calculate/… or "?") AND lettered options (A–E). Mere numbered paragraphs are NOT enough.
+   - "answer_key": Compact marking keys only (e.g. "1. A, 2. B, 3. D") with almost no question stems and no explanations.
+   - "explanation": "Explanations to the Answers", "Worked Solutions", "Solutions", or numbered prose that justifies answers ("because…", "therefore…", "the correct option is…") WITHOUT a full MCQ stem+options block. DO NOT extract these as questions — return pageType "explanation" and questions: [].
    - "cover_toc": Front cover, title page, table of contents, syllabus outlines, publishers notes, or preface.
    - "blank": Blank page or negligible text.
    - "unclear": Unreadable, heavily smudged, or completely corrupted text where questions cannot be reliably extracted.
+   - ANTI-PATTERN: Seeing "1. … 2. … 3. …" on an explanations page and labeling it question_content. Numbered commentary is still "explanation".
 
 2. MATHEMATICAL & SCIENTIFIC EXPRESSIONS (MANDATORY LATEX):
    - ALL formulas, mathematical expressions, fractions, powers, roots, scientific notations, and chemical equations MUST be expressed using clean LaTeX syntax enclosed in '$...$' (inline) or '$$...$$' (display).
-   - NEVER write math out in words (e.g. NEVER write "square root of 4x", "fraction 3 over 4", "x squared", "integral of f(x)").
+   - NEVER write math out in words (e.g. NEVER write "2 raise 2", "square root of 4x", "fraction 3 over 4", "x squared", "integral of f(x)").
    - ALWAYS express mathematically:
+     * Powers: $2^2$ (NOT "2 raise 2" / "2 raised to 2"), $x^2$, $10^{-6}$
      * Fractions: $\\frac{a}{b}$, $\\frac{x^2 + 1}{2x - 3}$
      * Square roots & Radicals: $\\sqrt{x}$, $\\sqrt{b^2 - 4ac}$, $\\sqrt[3]{V}$
-     * Powers & Subscripts: $x^2$, $a_n$, $v_0$, $10^{-6}$
+     * Subscripts: $a_n$, $v_0$
      * Trigonometric / Calculus: $\\sin(\\theta)$, $\\cos(2x)$, $\\tan^{-1}(y)$, $\\int_0^\\pi \\sin(x)dx$, $\\frac{dy}{dx}$
      * Physics symbols: $\\lambda$, $\\Omega$, $\\mu$, $\\rho$, $\\Delta T$, $F = ma$, $E = mc^2$, $v = u + at$
      * Chemical equations: $\\text{H}_2\\text{SO}_4$, $\\text{CaCO}_3 \\rightarrow \\text{CaO} + \\text{CO}_2$, $\\text{Na}^+ + \\text{Cl}^-$

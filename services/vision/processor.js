@@ -117,22 +117,30 @@ async function runOcrImage(dataUrl) {
   const ocrProvider = IS_HYBRID ? 'mistral' : providerForStage('ocr');
 
   if (ocrProvider === 'openrouter') {
-    return withRetry(
-      async () => openrouterProvider.ocrImage(dataUrl, { model: MODELS.ocr }),
-      { label: 'openrouter-ocr-image' }
-    );
+    try {
+      return await withRetry(
+        async () => openrouterProvider.ocrImage(dataUrl, { model: MODELS.ocr }),
+        { label: 'openrouter-ocr-image', retries: 1 }
+      );
+    } catch (err) {
+      console.warn(`[vision] OpenRouter OCR failed (${err.message}), falling back to Mistral OCR`);
+    }
   }
   if (ocrProvider === 'groq') {
-    return withRetry(
-      async () => groqProvider.ocrImage(dataUrl, { model: MODELS.ocr }),
-      { label: 'groq-ocr-image' }
-    );
+    try {
+      return await withRetry(
+        async () => groqProvider.ocrImage(dataUrl, { model: MODELS.ocr }),
+        { label: 'groq-ocr-image', retries: 1 }
+      );
+    } catch (err) {
+      console.warn(`[vision] Groq OCR failed (${err.message}), falling back to Mistral OCR`);
+    }
   }
   const mistral = getMistral();
   return withRetry(
     async () =>
       mistral.ocr.process({
-        model: MODELS.ocr,
+        model: 'mistral-ocr-latest',
         document: { type: 'image_url', imageUrl: dataUrl },
       }),
     { label: 'mistral-ocr-image' }
@@ -158,24 +166,42 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
   const chatProvider = IS_HYBRID ? providerForStage(stage) : PROVIDER;
 
   if (chatProvider === 'openrouter') {
-    const response = await withRetry(
-      async () => openrouterProvider.chatJson(system, user, { maxTokens, model }),
-      { label: `${label}:${model}` }
-    );
-    return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
+    if (process.env.OPENROUTER_API_KEY) {
+      try {
+        const response = await withRetry(
+          async () => openrouterProvider.chatJson(system, user, { maxTokens, model }),
+          { label: `${label}:${model}`, retries: 1 }
+        );
+        return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
+      } catch (err) {
+        console.warn(`[vision] OpenRouter chat failed (${err.message}), falling back to Mistral`);
+      }
+    } else {
+      console.warn('[vision] OPENROUTER_API_KEY not configured, using Mistral');
+    }
   }
   if (chatProvider === 'groq') {
-    const response = await withRetry(
-      async () => groqProvider.chatJson(system, user, { maxTokens, model }),
-      { label: `${label}:${model}` }
-    );
-    return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
+    if (process.env.GROQ_API_KEY) {
+      try {
+        const response = await withRetry(
+          async () => groqProvider.chatJson(system, user, { maxTokens, model }),
+          { label: `${label}:${model}`, retries: 1 }
+        );
+        return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
+      } catch (err) {
+        console.warn(`[vision] Groq chat failed (${err.message}), falling back to Mistral`);
+      }
+    } else {
+      console.warn('[vision] GROQ_API_KEY not configured, using Mistral');
+    }
   }
+
   const mistral = getMistral();
+  const fallbackModel = (model && model.startsWith('mistral')) ? model : 'mistral-small-latest';
   const response = await withRetry(
     async () =>
       mistral.chat.complete({
-        model,
+        model: fallbackModel,
         temperature: 0,
         responseFormat: { type: 'json_object' },
         messages: [
@@ -184,10 +210,10 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
         ],
         maxTokens,
       }),
-    { label: `${label}:${model}` }
+    { label: `${label}:${fallbackModel}` }
   );
   const content = response.choices?.[0]?.message?.content;
-  return { data: parseJsonContent(content), usage: response.usage, model };
+  return { data: parseJsonContent(content), usage: response.usage, model: fallbackModel };
 }
 
 // ── Question Grouping and Ordering ──────────────────────────────────────────

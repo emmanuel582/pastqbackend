@@ -106,6 +106,15 @@ router.delete('/sessions/:id', (req, res) => {
   res.json({ success: true });
 });
 
+router.delete('/sessions', (_req, res) => {
+  const sessions = listSessions();
+  for (const s of sessions) {
+    deleteSession(s.id);
+  }
+  saveJobs({});
+  res.json({ success: true, count: sessions.length });
+});
+
 router.post('/sessions/:id/pages', upload.array('images', 200), async (req, res) => {
   try {
     const session = getSession(req.params.id);

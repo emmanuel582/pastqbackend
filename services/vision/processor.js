@@ -2,7 +2,6 @@ import { Mistral } from '@mistralai/mistralai';
 import * as groqProvider from './groq.js';
 import * as openrouterProvider from './openrouterProvider.js';
 import {
-  CLASSIFY_PROMPT,
   EXTRACT_PROMPT,
   ANSWER_KEY_PROMPT,
   buildMemoryBlock,
@@ -621,15 +620,6 @@ function stitchContinuation(session, pageIndex, extracted) {
 }
 
 // ── Per-Page Execution ──────────────────────────────────────────────────────
-
-async function classifyPage(ocrMarkdown, memory) {
-  const { data, usage, model } = await chatJson(
-    CLASSIFY_PROMPT,
-    `${buildMemoryBlock(memory)}\n\n--- OCR TRANSCRIPTION ---\n${ocrMarkdown.slice(0, 8000)}\n--- END ---`,
-    { maxTokens: 1024, model: MODELS.cheap, label: 'classify' }
-  );
-  return { data, usage, model };
-}
 
 async function extractQuestions(ocrMarkdown, memory, subjectHint, model = MODELS.cheap) {
   const { data, usage, model: used } = await chatJson(

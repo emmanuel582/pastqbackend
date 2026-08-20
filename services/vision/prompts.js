@@ -141,7 +141,10 @@ function buildMemoryBlock(memory) {
 - lastHeadings: ${JSON.stringify((m.lastHeadings || []).slice(-10))}`;
 }
 
+const CLASSIFY_PROMPT = EXTRACT_PROMPT;
+
 export {
+  CLASSIFY_PROMPT,
   EXTRACT_PROMPT,
   ANSWER_KEY_PROMPT,
   buildMemoryBlock,

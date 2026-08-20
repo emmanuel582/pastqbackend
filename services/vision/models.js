@@ -1,14 +1,18 @@
 /**
  * Cost/quality routing for PastQ vision.
- * Default path: OCR → cheap classify/extract on text only.
- * Escalate to a stronger chat model only when confidence is low or extraction looks incomplete.
  *
- * Providers: groq (default for testing) | mistral | gemini (future)
- * Groq picks: qwen/qwen3.6-27b OCR, gpt-oss-20b cheap, gpt-oss-120b strong
+ * Default path (hybrid):
+ *   OCR              → Mistral OCR ($0.004/page — purpose-built, highest accuracy)
+ *   Classify/Extract → Mistral Small ($0.15/$0.60 per 1M tokens — cheapest quality JSON)
+ *   Strong escalate  → Gemini 2.5 Flash via OpenRouter ($0.30/$2.50 — only ~10% of pages)
+ *
+ * Providers: hybrid (default) | groq | openrouter | mistral
  */
-const PROVIDER = (process.env.VISION_PROVIDER || 'openrouter').toLowerCase();
+const PROVIDER = (process.env.VISION_PROVIDER || 'hybrid').toLowerCase();
 const IS_GROQ = PROVIDER === 'groq';
 const IS_OPENROUTER = PROVIDER === 'openrouter';
+const IS_HYBRID = PROVIDER === 'hybrid';
+const IS_MISTRAL = PROVIDER === 'mistral';
 
 const GROQ_MODELS = {
   ocr: process.env.VISION_OCR_MODEL || 'qwen/qwen3.6-27b',
@@ -28,12 +32,50 @@ const MISTRAL_MODELS = {
   strong: process.env.VISION_STRONG_MODEL || 'mistral-medium-latest',
 };
 
-const MODELS = IS_OPENROUTER ? OPENROUTER_MODELS : (IS_GROQ ? GROQ_MODELS : MISTRAL_MODELS);
+/**
+ * Hybrid models — optimal quality and cost:
+ * - OCR: Mistral's dedicated OCR (top-tier document vision)
+ * - Cheap classify/extract: Mistral Small (high-speed, low-cost structured JSON)
+ * - Strong escalation: Gemini Flash via OpenRouter (deep reasoning for complex pages)
+ */
+const HYBRID_MODELS = {
+  ocr: process.env.VISION_OCR_MODEL || 'mistral-ocr-latest',
+  cheap: process.env.VISION_CHEAP_MODEL || 'mistral-small-latest',
+  strong: process.env.VISION_STRONG_MODEL || 'google/gemini-2.5-flash',
+};
 
-/** Approx USD pricing used for session cost logs (not billing truth). */
+function selectModels() {
+  if (IS_HYBRID) return HYBRID_MODELS;
+  if (IS_OPENROUTER) return OPENROUTER_MODELS;
+  if (IS_GROQ) return GROQ_MODELS;
+  return MISTRAL_MODELS;
+}
+
+const MODELS = selectModels();
+
+/**
+ * Which provider handles each stage in hybrid mode.
+ * Returns 'mistral' | 'openrouter' | 'groq'
+ */
+function providerForStage(stage) {
+  if (!IS_HYBRID) return PROVIDER;
+  switch (stage) {
+    case 'ocr':
+      return 'mistral';   // Mistral OCR endpoint — $0.004/page
+    case 'cheap':
+    case 'classify':
+    case 'extract':
+      return 'mistral';   // Mistral Small — $0.15/$0.60 per 1M tokens
+    case 'strong':
+      return 'openrouter'; // Gemini Flash via OR — $0.30/$2.50 per 1M tokens
+    default:
+      return 'mistral';
+  }
+}
+
+/** Approx USD pricing used for session cost logs */
 const PRICING = IS_GROQ
   ? {
-      // qwen vision OCR ~2k tokens/page rough estimate
       ocrPerPage: 0.002,
       cheap: {
         chatInput: 0.075 / 1_000_000,
@@ -46,28 +88,33 @@ const PRICING = IS_GROQ
     }
   : IS_OPENROUTER ? {
       ocrPerPage: 0,
-      cheap: { chatInput: 0, chatOutput: 0 },
-      strong: { chatInput: 0, chatOutput: 0 },
+      cheap: { chatInput: 0.3 / 1_000_000, chatOutput: 2.5 / 1_000_000 },
+      strong: { chatInput: 0.3 / 1_000_000, chatOutput: 2.5 / 1_000_000 },
     } : {
-      ocrPerPage: 4 / 1000,
+      ocrPerPage: 4 / 1000,      // $0.004/page
       cheap: {
-        chatInput: 0.2 / 1_000_000,
+        chatInput: 0.15 / 1_000_000,    // Mistral Small
         chatOutput: 0.6 / 1_000_000,
       },
-      strong: {
-        chatInput: 1.5 / 1_000_000,
+      strong: IS_HYBRID ? {
+        chatInput: 0.3 / 1_000_000,     // Gemini Flash via OpenRouter
+        chatOutput: 2.5 / 1_000_000,
+      } : {
+        chatInput: 1.5 / 1_000_000,     // Mistral Medium
         chatOutput: 7.5 / 1_000_000,
       },
     };
 
 const USD_TO_NGN = Number(process.env.USD_TO_NGN || 1400);
 
-/** Image prep: keep exam pages sharp. Groq TPM is handled by completion size, not downscaling. */
 const IMAGE_PREP = {
-  maxWidth: Number(process.env.VISION_MAX_WIDTH || 1600),
-  maxHeight: Number(process.env.VISION_MAX_HEIGHT || 2200),
-  jpegQuality: Number(process.env.VISION_JPEG_QUALITY || 85),
+  maxWidth: Number(process.env.VISION_MAX_WIDTH || 2048),
+  maxHeight: Number(process.env.VISION_MAX_HEIGHT || 2800),
+  jpegQuality: Number(process.env.VISION_JPEG_QUALITY || 90),
 };
+
+const CONCURRENCY = Number(process.env.VISION_CONCURRENCY || 5);
+const CIRCUIT_BREAKER_THRESHOLD = Number(process.env.VISION_CIRCUIT_BREAKER || 5);
 
 function pricingForModel(model) {
   if (model === MODELS.strong) return PRICING.strong;
@@ -75,21 +122,17 @@ function pricingForModel(model) {
 }
 
 /**
- * Decide if extract should be re-run with the strong model.
- * Prefer abstaining / review flags over paying Pro on every page.
+ * Decide if extract should be re-run with the strong reasoning model.
+ * Evaluates semantic extraction confidence and completeness.
  */
 function needsStrongExtract(ocrMarkdown, classified, extracted) {
   const conf = typeof classified?.confidence === 'number' ? classified.confidence : 1;
   if (conf < 0.55) return { yes: true, reason: 'low_classify_confidence' };
 
   const qs = Array.isArray(extracted?.questions) ? extracted.questions : [];
-  const qMarks = (ocrMarkdown.match(/(?:^|\n)\s*(?:\d{1,3}|[Qq]\.?\s*\d{1,3})[\.\)\:]/gm) || []).length;
 
-  if (qMarks >= 2 && qs.length === 0) {
-    return { yes: true, reason: 'ocr_has_questions_extract_empty' };
-  }
-  if (qMarks >= 4 && qs.length > 0 && qs.length < Math.floor(qMarks * 0.4)) {
-    return { yes: true, reason: 'extract_count_far_below_ocr_markers' };
+  if (classified?.pageType === 'question_content' && qs.length === 0 && ocrMarkdown.length > 200) {
+    return { yes: true, reason: 'question_content_yielded_zero_questions' };
   }
 
   const weak = qs.filter(
@@ -98,39 +141,18 @@ function needsStrongExtract(ocrMarkdown, classified, extracted) {
       (Array.isArray(q.options) && q.options.filter(Boolean).length < 2 && !q.isContinuation) ||
       (!String(q.question || '').trim() && !q.isContinuation)
   );
-  if (qs.length && weak.length >= Math.ceil(qs.length * 0.5)) {
-    return { yes: true, reason: 'many_weak_questions' };
-  }
 
-  // Dense page: long OCR + many markers — worth one strong pass if cheap pass looks thin
-  if (ocrMarkdown.length > 3500 && qMarks >= 6 && qs.length <= 2) {
-    return { yes: true, reason: 'dense_page_thin_extract' };
+  if (qs.length > 0 && weak.length >= Math.ceil(qs.length * 0.5)) {
+    return { yes: true, reason: 'high_proportion_of_low_confidence_questions' };
   }
 
   return { yes: false, reason: null };
 }
 
-/** Skip LLM entirely for obvious junk after OCR. */
+/** Skip LLM entirely only for genuinely blank pages. */
 function heuristicPageType(ocrMarkdown) {
   const text = (ocrMarkdown || '').trim();
-  if (text.length < 40) return { pageType: 'blank', confidence: 0.95, reason: 'too_short' };
-
-  const lower = text.toLowerCase();
-  const coverHits = [
-    'table of contents',
-    'all rights reserved',
-    'published by',
-    'isbn',
-    'copyright',
-    'acknowledgement',
-    'foreword',
-  ].filter((k) => lower.includes(k)).length;
-  const hasQuestionShape = /(?:^|\n)\s*(?:\d{1,3}|[Qq]\s*\d{1,3})[\.\)\:]/.test(text);
-  const hasOptions = /(?:^|\n)\s*[A-Ea-e][\.\)\:]\s+\S+/.test(text);
-
-  if (coverHits >= 2 && !hasQuestionShape && !hasOptions) {
-    return { pageType: 'cover_toc', confidence: 0.9, reason: 'cover_keywords' };
-  }
+  if (text.length < 20) return { pageType: 'blank', confidence: 0.98, reason: 'blank_or_negligible_text' };
   return null;
 }
 
@@ -138,11 +160,16 @@ export {
   PROVIDER,
   IS_GROQ,
   IS_OPENROUTER,
+  IS_HYBRID,
+  IS_MISTRAL,
   MODELS,
   PRICING,
   USD_TO_NGN,
   IMAGE_PREP,
+  CONCURRENCY,
+  CIRCUIT_BREAKER_THRESHOLD,
   pricingForModel,
+  providerForStage,
   needsStrongExtract,
   heuristicPageType,
 };

@@ -1,24 +1,29 @@
-import {  Mistral  } from '@mistralai/mistralai';
+import { Mistral } from '@mistralai/mistralai';
 import * as groqProvider from './groq.js';
 import * as openrouterProvider from './openrouterProvider.js';
-import { 
+import {
   CLASSIFY_PROMPT,
   EXTRACT_PROMPT,
   ANSWER_KEY_PROMPT,
   buildMemoryBlock,
- } from './prompts.js';
+} from './prompts.js';
 import { getSession, saveSession, updateProgress, getJobs, saveJobs } from './store.js';
-import { 
+import { syncSessionToSupabase } from './supabaseSync.js';
+import {
   PROVIDER,
   IS_GROQ,
   IS_OPENROUTER,
+  IS_HYBRID,
   MODELS,
   PRICING,
   USD_TO_NGN,
+  CONCURRENCY,
+  CIRCUIT_BREAKER_THRESHOLD,
   pricingForModel,
+  providerForStage,
   needsStrongExtract,
   heuristicPageType,
- } from './models.js';
+} from './models.js';
 
 const MAX_RETRIES = 4;
 const activeWorkers = new Set();
@@ -39,10 +44,12 @@ async function withRetry(fn, { retries = MAX_RETRIES, label = 'op' } = {}) {
     } catch (err) {
       lastErr = err;
       const msg = err?.message || String(err);
-      const tooLarge = err?.status === 413 || /request too large/i.test(msg);
+      const tooLarge = err?.status === 413 || msg.toLowerCase().includes('request too large');
       const retryable =
         !tooLarge &&
-        (/timeout|429|500|502|503|504|ECONNRESET|ETIMEDOUT|network|rate/i.test(msg) ||
+        (msg.toLowerCase().includes('timeout') ||
+          msg.toLowerCase().includes('rate') ||
+          msg.toLowerCase().includes('network') ||
           err?.status >= 500 ||
           err?.status === 429);
       if (!retryable || attempt === retries) break;
@@ -66,8 +73,11 @@ function parseJsonContent(content) {
   try {
     return JSON.parse(trimmed);
   } catch {
-    const match = trimmed.match(/\{[\s\S]*\}/);
-    if (match) return JSON.parse(match[0]);
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    }
     throw new Error('Failed to parse model JSON');
   }
 }
@@ -102,14 +112,18 @@ function addCost(session, { ocrPages = 0, usage, model } = {}) {
   else if (model) cost.cheapCalls += 1;
 }
 
+// ── OCR routing ─────────────────────────────────────────────────────────────
+
 async function runOcrImage(dataUrl) {
-  if (IS_OPENROUTER) {
+  const ocrProvider = IS_HYBRID ? 'mistral' : providerForStage('ocr');
+
+  if (ocrProvider === 'openrouter') {
     return withRetry(
       async () => openrouterProvider.ocrImage(dataUrl, { model: MODELS.ocr }),
       { label: 'openrouter-ocr-image' }
     );
   }
-  if (IS_GROQ) {
+  if (ocrProvider === 'groq') {
     return withRetry(
       async () => groqProvider.ocrImage(dataUrl, { model: MODELS.ocr }),
       { label: 'groq-ocr-image' }
@@ -122,33 +136,36 @@ async function runOcrImage(dataUrl) {
         model: MODELS.ocr,
         document: { type: 'image_url', imageUrl: dataUrl },
       }),
-    { label: 'ocr-image' }
+    { label: 'mistral-ocr-image' }
   );
 }
 
 async function runOcrPdf(dataUrl) {
-  // OpenRouter/Groq don't natively ingest raw PDF buffers for OCR well.
-  // Mistral's dedicated OCR endpoint is perfect for this: highly accurate and only $0.004/page.
   const mistral = getMistral();
   return withRetry(
     async () =>
       mistral.ocr.process({
-        model: 'mistral-ocr-latest', // Hardcode model to guarantee it works regardless of VISION_OCR_MODEL
+        model: 'mistral-ocr-latest',
         document: { type: 'document_url', documentUrl: dataUrl },
       }),
     { label: 'ocr-pdf' }
   );
 }
 
+// ── Chat JSON routing ───────────────────────────────────────────────────────
+
 async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, label = 'chat-json' } = {}) {
-  if (IS_OPENROUTER) {
+  const stage = model === MODELS.strong ? 'strong' : 'cheap';
+  const chatProvider = IS_HYBRID ? providerForStage(stage) : PROVIDER;
+
+  if (chatProvider === 'openrouter') {
     const response = await withRetry(
       async () => openrouterProvider.chatJson(system, user, { maxTokens, model }),
       { label: `${label}:${model}` }
     );
     return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
   }
-  if (IS_GROQ) {
+  if (chatProvider === 'groq') {
     const response = await withRetry(
       async () => groqProvider.chatJson(system, user, { maxTokens, model }),
       { label: `${label}:${model}` }
@@ -174,11 +191,12 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
   return { data: parseJsonContent(content), usage: response.usage, model };
 }
 
+// ── Question Grouping and Ordering ──────────────────────────────────────────
+
 function groupKey(year, paper) {
   return `${year || 'Unknown'}::${paper || 'Default'}`;
 }
 
-/** Stable reading order: page → printed Q number → extraction sequence. */
 function compareQuestions(a, b) {
   const pa = a.pageIndex != null ? Number(a.pageIndex) : 1e9;
   const pb = b.pageIndex != null ? Number(b.pageIndex) : 1e9;
@@ -283,7 +301,7 @@ function detectNumberGaps(session) {
           id: `gap-${key}-${sorted[i - 1]}-${sorted[i]}`,
           type: 'missing_questions',
           status: 'open',
-          message: `${year} ${paper !== 'Default' ? 'Paper ' + paper + ' ' : ''}has a gap between Q${sorted[i - 1]} and Q${sorted[i]}. A page may be missing — can you upload the missing page?`,
+          message: `${year} ${paper !== 'Default' ? 'Paper ' + paper + ' ' : ''}has a gap between Q${sorted[i - 1]} and Q${sorted[i]}. A page may be missing — please review or upload the missing page.`,
           meta: { year, paper, from: sorted[i - 1], to: sorted[i] },
           createdAt: Date.now(),
         });
@@ -310,7 +328,7 @@ function detectCountAnomalies(session) {
         id: `short-${key}`,
         type: 'count_anomaly',
         status: 'open',
-        message: `${year}${paper && paper !== 'Default' ? ' Paper ' + paper : ''} has ${count} questions while most years average ~${Math.round(median)}. This looks incomplete — missing pages?`,
+        message: `${year}${paper && paper !== 'Default' ? ' Paper ' + paper : ''} has ${count} questions while most years average ~${Math.round(median)}. This may be incomplete.`,
         meta: { year, paper, count, median },
         createdAt: Date.now(),
       });
@@ -342,12 +360,141 @@ function nextQuestionId(session) {
   return max + 1;
 }
 
+function cleanOptionPrefix(text) {
+  const str = String(text || '').trim();
+  if (!str) return '';
+  // Check common prefixes cleanly without complex regex
+  const prefixes = ['A.', 'B.', 'C.', 'D.', 'E.', 'A)', 'B)', 'C)', 'D)', 'E)', '(A)', '(B)', '(C)', '(D)', '(E)', 'a.', 'b.', 'c.', 'd.', 'e.', 'a)', 'b)', 'c)', 'd)', 'e)'];
+  for (const p of prefixes) {
+    if (str.startsWith(p)) {
+      return str.slice(p.length).trim();
+    }
+  }
+  return str;
+}
+
 function normalizeOptions(options) {
   if (!Array.isArray(options)) return [];
   return options
-    .map((o) => String(o || '').replace(/^\s*[A-Ea-e][\)\.\:\-]\s*/, '').trim())
+    .map((o) => cleanOptionPrefix(o))
     .filter(Boolean);
 }
+
+// ── Smart Contextual Inference (No Regex) ───────────────────────────────────
+
+function getMostCommonSubject(session, year, paper) {
+  const key = groupKey(year, paper);
+  const counts = {};
+  for (const q of session.questions || []) {
+    if (groupKey(q.year, q.paper) !== key) continue;
+    if (!q.subject || q.subject === 'General' || q.subject === 'Unknown') continue;
+    counts[q.subject] = (counts[q.subject] || 0) + 1;
+  }
+  let best = null, bestCount = 0;
+  for (const [subj, count] of Object.entries(counts)) {
+    if (count > bestCount) { best = subj; bestCount = count; }
+  }
+  return best;
+}
+
+function autoAssignMissing(session, question) {
+  if (!question.subject || question.subject === 'General' || question.subject === 'Unknown') {
+    if (session.memory?.activeSubject) {
+      question.subject = session.memory.activeSubject;
+    } else if (session.subjectHint) {
+      question.subject = session.subjectHint;
+    } else {
+      const groupSubj = getMostCommonSubject(session, question.year, question.paper);
+      question.subject = groupSubj || 'General';
+    }
+  }
+
+  if (!question.year || question.year === 'Unknown') {
+    if (session.memory?.activeYear) {
+      question.year = session.memory.activeYear;
+    }
+  }
+
+  if (!question.paper || question.paper === 'Default') {
+    if (session.memory?.activePaper) {
+      question.paper = session.memory.activePaper;
+    }
+  }
+}
+
+// ── Deduplication & Sequential Validation (Structural) ─────────────────────
+
+function deduplicateQuestions(session) {
+  const byKey = new Map();
+  let removed = 0;
+
+  for (const q of session.questions || []) {
+    if (q.questionNumber == null) continue;
+    const key = `${groupKey(q.year, q.paper)}::Q${q.questionNumber}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, []);
+    }
+    byKey.get(key).push(q);
+  }
+
+  for (const [, dups] of byKey) {
+    if (dups.length <= 1) continue;
+
+    // Sort by confidence desc, keep the best version
+    dups.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    const keep = dups[0];
+    keep.needsReview = true;
+
+    for (let i = 1; i < dups.length; i++) {
+      const idx = session.questions.indexOf(dups[i]);
+      if (idx >= 0) {
+        session.questions.splice(idx, 1);
+        removed++;
+      }
+    }
+  }
+
+  if (removed > 0) {
+    console.log(`[dedup] resolved ${removed} duplicate question(s)`);
+  }
+  return removed;
+}
+
+function validateQuestionSequence(session) {
+  const followUps = [];
+  const byGroup = new Map();
+
+  for (const q of session.questions || []) {
+    if (q.questionNumber == null) continue;
+    const key = groupKey(q.year, q.paper);
+    if (!byGroup.has(key)) byGroup.set(key, []);
+    byGroup.get(key).push(q);
+  }
+
+  for (const [key, qs] of byGroup) {
+    qs.sort((a, b) => (a.pageIndex || 0) - (b.pageIndex || 0));
+
+    for (let i = 1; i < qs.length; i++) {
+      const prev = Number(qs[i - 1].questionNumber);
+      const curr = Number(qs[i].questionNumber);
+
+      if (Math.abs(curr - prev) > 30 && qs[i - 1].pageIndex !== qs[i].pageIndex) {
+        const [year, paper] = key.split('::');
+        followUps.push({
+          id: `seq-anomaly-${key}-${prev}-${curr}`,
+          type: 'sequence_anomaly',
+          status: 'open',
+          message: `${year}${paper !== 'Default' ? ' Paper ' + paper : ''}: Large jump from Q${prev} to Q${curr}. Please verify page ordering.`,
+          meta: { year, paper, from: prev, to: curr },
+        });
+      }
+    }
+  }
+
+  return followUps;
+}
+
+// ── Cross-Page Stitching ────────────────────────────────────────────────────
 
 function stitchContinuation(session, pageIndex, extracted) {
   const memory = session.memory;
@@ -358,22 +505,21 @@ function stitchContinuation(session, pageIndex, extracted) {
 
   if (extracted?.pageMeta?.year) memory.activeYear = String(extracted.pageMeta.year);
   if (extracted?.pageMeta?.paper) memory.activePaper = String(extracted.pageMeta.paper);
+  if (extracted?.pageMeta?.subject) memory.activeSubject = String(extracted.pageMeta.subject);
 
   let list = Array.isArray(extracted?.questions) ? [...extracted.questions] : [];
-  // Keep on-page order: prefer printed question numbers when present
   list.sort((a, b) => {
     const na = a?.questionNumber != null ? Number(a.questionNumber) : null;
     const nb = b?.questionNumber != null ? Number(b.questionNumber) : null;
     if (na != null && nb != null) return na - nb;
-    return 0; // preserve model order otherwise
+    return 0;
   });
 
   list.forEach((raw, idxOnPage) => {
     let qText = String(raw.question || '').trim();
     let options = normalizeOptions(raw.options);
-    // Only the FIRST item can be a page-start continuation; later ones are new questions
     const isCont =
-      !!raw.isContinuation || (!!extracted?.pageMeta?.isContinuation && idxOnPage === 0);
+      Boolean(raw.isContinuation) || (Boolean(extracted?.pageMeta?.isContinuation) && idxOnPage === 0);
 
     if (isCont && memory.openQuestion) {
       const open = memory.openQuestion;
@@ -387,8 +533,8 @@ function stitchContinuation(session, pageIndex, extracted) {
         correct: raw.correct != null ? raw.correct : open.correct,
         explanation: raw.explanation || open.explanation || '',
         continuesToPage: pageIndex,
-        incomplete: !!raw.incomplete,
-        needsReview: !!(raw.needsReview || open.needsReview),
+        incomplete: Boolean(raw.incomplete),
+        needsReview: Boolean(raw.needsReview || open.needsReview),
       };
       const existingIdx = session.questions.findIndex((q) => q.id === open.id);
       if (existingIdx >= 0) {
@@ -408,13 +554,14 @@ function stitchContinuation(session, pageIndex, extracted) {
 
     const year = raw.year || extracted?.pageMeta?.year || memory.activeYear || null;
     const paper = raw.paper || extracted?.pageMeta?.paper || memory.activePaper || null;
+    const subject = raw.subject || extracted?.pageMeta?.subject || memory.activeSubject || session.subjectHint || 'General';
     const id = nextId++;
     const orderIndex = nextOrder++;
 
     const q = {
       id,
       orderIndex,
-      subject: raw.subject || session.subjectHint || 'General',
+      subject,
       question: qText,
       options: options.length ? options : ['', '', '', ''],
       correct: raw.correct === undefined ? null : raw.correct,
@@ -428,12 +575,15 @@ function stitchContinuation(session, pageIndex, extracted) {
       continuesToPage: null,
       sourceType: 'question',
       confidence: typeof raw.confidence === 'number' ? raw.confidence : 0.7,
-      needsReview: !!raw.needsReview || options.length < 2,
-      incomplete: !!raw.incomplete,
+      needsReview: Boolean(raw.needsReview) || options.length < 2,
+      incomplete: Boolean(raw.incomplete),
     };
+
+    autoAssignMissing(session, q);
 
     if (memory.activeYear == null && year) memory.activeYear = String(year);
     if (memory.activePaper == null && paper) memory.activePaper = String(paper);
+    if (memory.activeSubject == null && subject && subject !== 'General') memory.activeSubject = subject;
 
     if (q.questionNumber != null) {
       memory.recentQuestionNumbers = [
@@ -452,7 +602,7 @@ function stitchContinuation(session, pageIndex, extracted) {
     memory.openQuestion = {
       id: memory.openQuestion?.id || nextId++,
       orderIndex: memory.openQuestion?.orderIndex || nextOrder++,
-      subject: carry.subject || session.subjectHint || 'General',
+      subject: carry.subject || memory.activeSubject || session.subjectHint || 'General',
       question: String(carry.question || ''),
       options: normalizeOptions(carry.options),
       correct: carry.correct ?? null,
@@ -470,10 +620,12 @@ function stitchContinuation(session, pageIndex, extracted) {
   return out;
 }
 
+// ── Per-Page Execution ──────────────────────────────────────────────────────
+
 async function classifyPage(ocrMarkdown, memory) {
   const { data, usage, model } = await chatJson(
     CLASSIFY_PROMPT,
-    `${buildMemoryBlock(memory)}\n\n--- OCR ---\n${ocrMarkdown.slice(0, 8000)}\n--- END ---`,
+    `${buildMemoryBlock(memory)}\n\n--- OCR TRANSCRIPTION ---\n${ocrMarkdown.slice(0, 8000)}\n--- END ---`,
     { maxTokens: 1024, model: MODELS.cheap, label: 'classify' }
   );
   return { data, usage, model };
@@ -482,7 +634,7 @@ async function classifyPage(ocrMarkdown, memory) {
 async function extractQuestions(ocrMarkdown, memory, subjectHint, model = MODELS.cheap) {
   const { data, usage, model: used } = await chatJson(
     EXTRACT_PROMPT,
-    `${buildMemoryBlock(memory)}\nSubject hint: ${subjectHint || 'unknown'}\n\nIMPORTANT: Prefer incomplete/needsReview over inventing options or answers. correct must be null unless clearly marked.\n\n--- OCR ---\n${ocrMarkdown.slice(0, 14000)}\n--- END ---`,
+    `${buildMemoryBlock(memory)}\nContext subject: ${subjectHint || 'Deduce from content'}\n\nFormat all mathematical, physical, and chemical formulas in standard LaTeX ($...$). Discard background noise from adjacent pages.\n\n--- OCR TRANSCRIPTION ---\n${ocrMarkdown.slice(0, 14000)}\n--- END ---`,
     { maxTokens: 8192, model, label: 'extract' }
   );
   return { data, usage, model: used };
@@ -491,7 +643,7 @@ async function extractQuestions(ocrMarkdown, memory, subjectHint, model = MODELS
 async function extractAnswerKey(ocrMarkdown, memory) {
   const { data, usage, model } = await chatJson(
     ANSWER_KEY_PROMPT,
-    `${buildMemoryBlock(memory)}\n\n--- OCR ---\n${ocrMarkdown.slice(0, 10000)}\n--- END ---`,
+    `${buildMemoryBlock(memory)}\n\n--- OCR TRANSCRIPTION ---\n${ocrMarkdown.slice(0, 10000)}\n--- END ---`,
     { maxTokens: 4096, model: MODELS.cheap, label: 'answers' }
   );
   return { data, usage, model };
@@ -505,14 +657,16 @@ async function processOnePage(session, page) {
 
   let ocrMarkdown = page.ocrMarkdown || '';
 
-  // OCR once — never re-send the image for classify/extract
+  // Step 1: High-fidelity OCR via dedicated engine
   if (!ocrMarkdown) {
-    console.log(`[vision] page ${page.index + 1} OCR via ${PROVIDER} ${MODELS.ocr}`);
+    const ocrProv = IS_HYBRID ? 'mistral' : PROVIDER;
+    console.log(`[vision] page ${page.index + 1} OCR via ${ocrProv} ${MODELS.ocr}`);
     if (!page.dataUrl && !page.imagePath) {
       throw new Error('Page has no image or OCR text');
     }
     let dataUrl = page.dataUrl;
     if (!dataUrl && page.imagePath) {
+      const fs = await import('node:fs');
       const buf = fs.readFileSync(page.imagePath);
       dataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
     }
@@ -537,7 +691,6 @@ async function processOnePage(session, page) {
     return;
   }
 
-  // Free skip for obvious cover/blank — no chat spend
   const heuristic = heuristicPageType(ocrMarkdown);
   if (heuristic) {
     page.pageType = heuristic.pageType;
@@ -547,40 +700,56 @@ async function processOnePage(session, page) {
     return;
   }
 
-  const { data: classified, usage: cUsage, model: cModel } = await classifyPage(
+  // Step 2: High-Speed Unified Extraction & Subject Reasoning (Single LLM pass)
+  const effectiveSubjectHint =
+    session.memory.activeSubject || session.subjectHint || null;
+
+  let { data: extracted, usage: eUsage, model: eModel } = await extractQuestions(
     ocrMarkdown,
-    session.memory
+    session.memory,
+    effectiveSubjectHint,
+    MODELS.cheap
   );
-  addCost(session, { usage: cUsage, model: cModel });
-  page.pageType = classified.pageType || 'question_content';
-  page.classifyConfidence = classified.confidence ?? null;
+  addCost(session, { usage: eUsage, model: eModel });
 
-  if (classified.detectedYear) {
-    session.memory.activeYear = String(classified.detectedYear);
+  const pageMeta = extracted?.pageMeta || {};
+  const pageType = pageMeta.pageType || (extracted?.questions?.length > 0 ? 'question_content' : 'blank');
+  page.pageType = pageType;
+  page.classifyConfidence = pageMeta.confidence ?? 0.9;
+
+  if (pageMeta.year) {
+    session.memory.activeYear = String(pageMeta.year);
     session.memory.lastHeadings = [
       ...(session.memory.lastHeadings || []).slice(-9),
-      `year:${classified.detectedYear}`,
+      `year:${pageMeta.year}`,
     ];
   }
-  if (classified.detectedPaper) {
-    session.memory.activePaper = String(classified.detectedPaper);
+  if (pageMeta.paper) {
+    session.memory.activePaper = String(pageMeta.paper);
     session.memory.lastHeadings = [
       ...(session.memory.lastHeadings || []).slice(-9),
-      `paper:${classified.detectedPaper}`,
+      `paper:${pageMeta.paper}`,
+    ];
+  }
+  if (pageMeta.subject) {
+    session.memory.activeSubject = String(pageMeta.subject);
+    session.memory.lastHeadings = [
+      ...(session.memory.lastHeadings || []).slice(-9),
+      `subject:${pageMeta.subject}`,
     ];
   }
 
-  if (classified.pageType === 'blank' || classified.pageType === 'cover_toc') {
+  if (pageType === 'blank' || pageType === 'cover_toc') {
     page.status = 'skipped';
     return;
   }
 
-  if (classified.pageType === 'unclear' || classified.needsClearerImage) {
+  if (pageType === 'unclear') {
     page.status = 'needs_input';
     const fu = {
       id: `unclear-${page.id}`,
       type: 'unclear_image',
-      message: `Page ${page.index + 1} is too unclear to trust. Please upload a clearer photo of this page.`,
+      message: `Page ${page.index + 1} is too blurry or damaged. Please upload a clearer photo of this page.`,
       pageId: page.id,
       meta: { pageIndex: page.index },
     };
@@ -589,7 +758,7 @@ async function processOnePage(session, page) {
     return;
   }
 
-  if (classified.pageType === 'answer_key') {
+  if (pageType === 'answer_key') {
     session.memory.answersSectionStarted = true;
     const { data: answers, usage: aUsage, model: aModel } = await extractAnswerKey(
       ocrMarkdown,
@@ -617,16 +786,8 @@ async function processOnePage(session, page) {
     return;
   }
 
-  // Cheap extract first (text only — no image)
-  let { data: extracted, usage: eUsage, model: eModel } = await extractQuestions(
-    ocrMarkdown,
-    session.memory,
-    session.subjectHint,
-    MODELS.cheap
-  );
-  addCost(session, { usage: eUsage, model: eModel });
-
-  const gate = needsStrongExtract(ocrMarkdown, classified, extracted);
+  // Step 3: Selective Escalation to Strong Reasoning Model if required
+  const gate = needsStrongExtract(ocrMarkdown, pageMeta, extracted);
   if (gate.yes) {
     console.log(`[escalate] page ${page.index + 1}: ${gate.reason}`);
     ensureCost(session).escalations += 1;
@@ -635,13 +796,14 @@ async function processOnePage(session, page) {
     const strong = await extractQuestions(
       ocrMarkdown,
       session.memory,
-      session.subjectHint,
+      effectiveSubjectHint,
       MODELS.strong
     );
     addCost(session, { usage: strong.usage, model: strong.model });
     extracted = strong.data;
   }
 
+  // Step 4: Stitching & Session Assembly
   const stitched = stitchContinuation(session, page.index, extracted);
   for (const q of stitched) {
     if (!session.questions.some((x) => x.id === q.id)) {
@@ -658,9 +820,53 @@ async function processOnePage(session, page) {
   );
 
   applyAnswerKeys(session);
+  deduplicateQuestions(session);
   rebuildGroups(session);
   page.status = 'done';
 }
+
+function trimMemory(session) {
+  const mem = session.memory;
+  if (!mem) return;
+  if (mem.recentQuestionNumbers && mem.recentQuestionNumbers.length > 30) {
+    mem.recentQuestionNumbers = mem.recentQuestionNumbers.slice(-30);
+  }
+  if (mem.lastHeadings && mem.lastHeadings.length > 10) {
+    mem.lastHeadings = mem.lastHeadings.slice(-10);
+  }
+}
+
+// ── Concurrency Semaphore ───────────────────────────────────────────────────
+
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.current = 0;
+    this.queue = [];
+  }
+
+  acquire() {
+    return new Promise((resolve) => {
+      if (this.current < this.max) {
+        this.current++;
+        resolve();
+      } else {
+        this.queue.push(resolve);
+      }
+    });
+  }
+
+  release() {
+    this.current--;
+    if (this.queue.length > 0) {
+      this.current++;
+      const next = this.queue.shift();
+      next();
+    }
+  }
+}
+
+// ── Master Session Worker ───────────────────────────────────────────────────
 
 async function runSessionWorker(sessionId) {
   if (activeWorkers.has(sessionId)) return;
@@ -670,52 +876,106 @@ async function runSessionWorker(sessionId) {
     let session = getSession(sessionId);
     if (!session) return;
 
+    session.memory = session.memory || {};
+    if (!('activeSubject' in session.memory)) {
+      session.memory.activeSubject = null;
+    }
+
     session.status = 'processing';
     saveSession(session);
-    console.log(`[vision] worker start ${sessionId} pages=${session.pages.length} provider=${PROVIDER}`);
+    const providerLabel = IS_HYBRID ? `hybrid(mistral+openrouter)` : PROVIDER;
+    console.log(`[vision] worker start ${sessionId} pages=${session.pages.length} provider=${providerLabel}`);
+
+    const sem = new Semaphore(CONCURRENCY);
+    let consecutiveFailures = 0;
+    let circuitBroken = false;
 
     while (true) {
       session = getSession(sessionId);
       if (!session) break;
 
-      const next = session.pages.find((p) => p.status === 'pending');
-      if (!next) break;
-
-      try {
-        await processOnePage(session, next);
-      } catch (err) {
-        console.error(`Page ${next.index} error:`, err);
-        next.retryCount = (next.retryCount || 0) + 1;
-        next.error = err.message || String(err);
-        if (next.retryCount <= MAX_RETRIES) {
-          next.status = 'pending';
-          await sleep(Math.min(30000, 1000 * Math.pow(2, next.retryCount)));
-        } else {
-          next.status = 'failed';
-          mergeFollowUps(session, [
-            {
-              id: `fail-${next.id}`,
-              type: 'page_failed',
-              message: `Page ${next.index + 1} failed after retries: ${next.error}. You can resume to retry or replace this page.`,
-              pageId: next.id,
-            },
-          ]);
-        }
+      if (circuitBroken) {
+        console.error(`[circuit-breaker] ${sessionId}: ${CIRCUIT_BREAKER_THRESHOLD} consecutive failures — pausing`);
+        mergeFollowUps(session, [{
+          id: `circuit-${sessionId}-${Date.now()}`,
+          type: 'circuit_breaker',
+          status: 'open',
+          message: `Processing paused after ${CIRCUIT_BREAKER_THRESHOLD} consecutive failures. Please check your API keys/credits and resume.`,
+          meta: { consecutiveFailures },
+        }]);
+        saveSession(session);
+        break;
       }
 
-      updateProgress(session);
-      rebuildGroups(session);
-      saveSession(session);
+      const pendingPages = session.pages.filter((p) => p.status === 'pending');
+      if (!pendingPages.length) break;
+
+      const batch = pendingPages.slice(0, CONCURRENCY);
+      const promises = batch.map(async (page) => {
+        await sem.acquire();
+        try {
+          const freshSession = getSession(sessionId);
+          if (!freshSession) return;
+
+          await processOnePage(freshSession, page);
+          consecutiveFailures = 0;
+
+          trimMemory(freshSession);
+          updateProgress(freshSession);
+          rebuildGroups(freshSession);
+          saveSession(freshSession);
+
+          // Progressive Supabase Sync
+          syncSessionToSupabase(freshSession).catch((err) =>
+            console.warn('[supabase-sync] progressive sync error:', err.message)
+          );
+        } catch (err) {
+          console.error(`Page ${page.index} error:`, err);
+          const s = getSession(sessionId);
+          if (!s) return;
+
+          page.retryCount = (page.retryCount || 0) + 1;
+          page.error = err.message || String(err);
+
+          if (page.retryCount <= MAX_RETRIES) {
+            page.status = 'pending';
+            await sleep(Math.min(30000, 1000 * Math.pow(2, page.retryCount)));
+          } else {
+            page.status = 'failed';
+            consecutiveFailures++;
+            if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+              circuitBroken = true;
+            }
+            mergeFollowUps(s, [
+              {
+                id: `fail-${page.id}`,
+                type: 'page_failed',
+                message: `Page ${page.index + 1} failed after retries: ${page.error}. You can resume to retry or replace this page.`,
+                pageId: page.id,
+              },
+            ]);
+          }
+
+          updateProgress(s);
+          saveSession(s);
+        } finally {
+          sem.release();
+        }
+      });
+
+      await Promise.all(promises);
     }
 
     session = getSession(sessionId);
     if (!session) return;
 
-    // final anomaly pass + lock final CBT order
     mergeFollowUps(session, detectNumberGaps(session));
     mergeFollowUps(session, detectCountAnomalies(session));
+    mergeFollowUps(session, validateQuestionSequence(session));
     applyAnswerKeys(session);
+    deduplicateQuestions(session);
     rebuildGroups(session, { renumber: true });
+    trimMemory(session);
     updateProgress(session);
 
     const hasPending = session.pages.some((p) => p.status === 'pending' || p.status === 'processing');
@@ -734,7 +994,6 @@ async function runSessionWorker(sessionId) {
       session.status = 'completed';
     }
 
-    // compatibility: mirror into jobs.json shape for old client pollers
     const jobs = getJobs();
     jobs[sessionId] = {
       id: sessionId,
@@ -756,8 +1015,12 @@ async function runSessionWorker(sessionId) {
       session: true,
     };
     saveJobs(jobs);
-
     saveSession(session);
+
+    // Final comprehensive Supabase sync
+    syncSessionToSupabase(session).catch((err) =>
+      console.warn('[supabase-sync] final sync error:', err.message)
+    );
   } finally {
     activeWorkers.delete(sessionId);
   }
@@ -787,4 +1050,6 @@ export {
   mergeFollowUps,
   letterToIndex,
   addCost,
+  deduplicateQuestions,
+  validateQuestionSequence,
 };

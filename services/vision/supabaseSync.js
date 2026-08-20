@@ -53,12 +53,6 @@ async function syncSessionToSupabase(session) {
       status: session.status || 'processing',
       questions: session.questions || [],
       groups: session.groups || [],
-      subject: session.memory?.activeSubject || session.subjectHint || null,
-      question_count: (session.questions || []).length,
-      cost: session.cost || null,
-      progress: session.progress || null,
-      follow_ups: (session.followUps || []).filter((f) => f.status !== 'resolved'),
-      answer_key_count: (session.answerKeys || []).length,
       created_at: session.createdAt ? new Date(session.createdAt).toISOString() : new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };

@@ -35,10 +35,6 @@ if (!process.env.MISTRAL_API_KEY) {
   console.warn('Warning: MISTRAL_API_KEY is not set in .env');
 }
 
-if ((process.env.VISION_PROVIDER || 'groq').toLowerCase() === 'groq' && !process.env.GROQ_API_KEY) {
-  console.warn('Warning: GROQ_API_KEY is not set in .env (VISION_PROVIDER=groq)');
-}
-
 function addPagesFromImages(session, files) {
   const startIndex = session.pages.length;
   const added = [];

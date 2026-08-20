@@ -32,9 +32,13 @@ app.use(cors({
     if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
       return callback(null, true);
     }
-    return callback(new Error(`CORS blocked for origin: ${origin}`));
+    // Reject without throwing — throwing strips CORS headers and looks like a browser CORS failure
+    console.warn(`[cors] blocked origin: ${origin}`);
+    return callback(null, false);
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(express.json({ limit: '20mb' }));
@@ -71,9 +75,6 @@ app.get('/api/health', (_req, res) => {
 
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err.message || err);
-  if (err.message && err.message.startsWith('CORS blocked')) {
-    return res.status(403).json({ error: err.message });
-  }
   res.status(500).json({ error: 'Internal server error' });
 });
 

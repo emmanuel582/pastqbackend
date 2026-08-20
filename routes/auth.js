@@ -9,13 +9,22 @@ const supabaseUrl =
   process.env.VITE_SUPABASE_URL ||
   'https://ovrlwgslzqvdofgkfcxl.supabase.co';
 
+// Prefer service role for server-side profile writes (bypasses RLS)
+const supabaseKey =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SERVICE_KEY ||
+  process.env.SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im92cmx3Z3NsenF2ZG9mZ2tmY3hsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYwMzU5OTQsImV4cCI6MjEwMTYxMTk5NH0.1mcIfa4B40A6A4sGmJyxB6a3i0ApjzWYteB68K2k8tQ';
+
 const supabaseAnonKey =
   process.env.SUPABASE_ANON_KEY ||
   process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im92cmx3Z3NsenF2ZG9mZ2tmY3hsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYwMzU5OTQsImV4cCI6MjEwMTYxMTk5NH0.1mcIfa4B40A6A4sGmJyxB6a3i0ApjzWYteB68K2k8tQ';
 
 // Provide WebSocket polyfill for Node (required by supabase-js realtime on Render)
-const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+const supabase = createClient(supabaseUrl, supabaseKey, {
   realtime: {
     transport: ws,
   },
@@ -23,6 +32,12 @@ const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     persistSession: false,
     autoRefreshToken: false,
   },
+});
+
+// Auth endpoints must use the anon key (signUp/signIn expect the public client role)
+const supabaseAuth = createClient(supabaseUrl, supabaseAnonKey, {
+  realtime: { transport: ws },
+  auth: { persistSession: false, autoRefreshToken: false },
 });
 
 // Register user
@@ -34,7 +49,7 @@ router.post('/signup', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const { data, error } = await supabase.auth.signUp({
+    const { data, error } = await supabaseAuth.auth.signUp({
       email,
       password,
       options: {
@@ -48,7 +63,7 @@ router.post('/signup', async (req, res) => {
       return res.status(400).json({ error: error.message });
     }
 
-    // Create profile record in users table
+    // Create profile record in users table (service-role client bypasses RLS)
     if (data.user) {
       const { error: dbError } = await supabase.from("users").insert({
         id: data.user.id,
@@ -79,7 +94,7 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const { data, error } = await supabase.auth.signInWithPassword({
+    const { data, error } = await supabaseAuth.auth.signInWithPassword({
       email,
       password,
     });
@@ -98,7 +113,7 @@ router.post('/login', async (req, res) => {
 // Logout user
 router.post('/logout', async (req, res) => {
   try {
-    const { error } = await supabase.auth.signOut();
+    const { error } = await supabaseAuth.auth.signOut();
     
     if (error) {
       return res.status(400).json({ error: error.message });

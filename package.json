@@ -7,11 +7,13 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "start:extraction": "node src/index.js",
+    "dev:extraction": "node --watch src/index.js",
     "test:openrouter:e2e": "node scripts/test-openrouter-e2e.js"
   },
-  "description": "PastQ backend API — OpenRouter Gemini OCR extraction",
+  "description": "PastQ backend API — vision sessions + OCR",
   "dependencies": {
     "@mistralai/mistralai": "^2.6.3",
     "@supabase/supabase-js": "^2.112.3",

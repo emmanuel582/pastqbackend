@@ -17,6 +17,7 @@
 | `MISTRAL_API_KEY` | your Mistral key |
 | `SUPABASE_URL` | `https://ovrlwgslzqvdofgkfcxl.supabase.co` |
 | `SUPABASE_ANON_KEY` | your Supabase anon key |
+| `SUPABASE_SERVICE_ROLE_KEY` | your Supabase service role key (recommended) |
 | `FRONTEND_URL` | your Vercel URL, e.g. `https://pastqfrontend.vercel.app` |
 
 5. Deploy → copy the Render URL (e.g. `https://pastq-backend.onrender.com`)
@@ -30,3 +31,7 @@ npm install
 cp .env.example .env
 npm start
 ```
+
+`npm start` runs the vision API (`index.js`) used by the Vercel frontend (`/api/health`, `/api/vision/*`).
+
+For the alternate OpenRouter extraction server: `npm run start:extraction` (health at `/health`).

@@ -59,7 +59,7 @@ async function syncSessionToSupabase(session) {
       status: session.status || 'processing',
       questions: session.questions || [],
       groups: session.groups || [],
-      subject: session.memory?.activeSubject || session.subjectHint || null,
+      subject: session.memory?.activeSubject || session.subjectHint || 'General',
       question_count: (session.questions || []).length,
       cost: session.cost || null,
       progress: session.progress || null,
@@ -76,9 +76,26 @@ async function syncSessionToSupabase(session) {
     let attempts = 0;
     while (attempts < 15) {
       attempts++;
+      
+      const currentPayload = { ...payload };
+      let hasUnknowns = false;
+      const descObj = {};
+      
+      // Pack all currently known missing columns into 'description' as a JSON string
+      for (const col of unknownColumns) {
+        if (payload.hasOwnProperty(col)) {
+          descObj[col] = payload[col];
+          delete currentPayload[col];
+          hasUnknowns = true;
+        }
+      }
+      if (hasUnknowns) {
+        currentPayload.description = JSON.stringify(descObj);
+      }
+
       const { error } = await supabase
         .from('library_bundles')
-        .upsert(payload, { onConflict: 'id' });
+        .upsert(currentPayload, { onConflict: 'id' });
 
       if (!error) {
         return { synced: true };
@@ -92,10 +109,9 @@ async function syncSessionToSupabase(session) {
 
       // Adaptively detect columns that do not exist in the database schema cache
       const missingColMatch = error.message?.match(/Could not find the '([^']+)' column/i);
-      if (missingColMatch && missingColMatch[1] && payload.hasOwnProperty(missingColMatch[1])) {
+      if (missingColMatch && missingColMatch[1] && currentPayload.hasOwnProperty(missingColMatch[1])) {
         const col = missingColMatch[1];
         unknownColumns.add(col);
-        delete payload[col];
         continue;
       }
 

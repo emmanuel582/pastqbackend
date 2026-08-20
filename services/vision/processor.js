@@ -18,6 +18,7 @@ import {
   USD_TO_NGN,
   CONCURRENCY,
   CIRCUIT_BREAKER_THRESHOLD,
+  STRONG_FALLBACK_MODEL,
   pricingForModel,
   providerForStage,
   needsStrongExtract,
@@ -27,6 +28,47 @@ import {
 const MAX_RETRIES = 4;
 const activeWorkers = new Set();
 const abortedSessions = new Set();
+/** Once OpenRouter auth fails in-process, skip further OR attempts (avoid 401 spam). */
+let openRouterUnavailable = false;
+
+// ── Per-Session Mutex (prevents concurrent read-modify-write corruption) ────
+const sessionLocks = new Map();
+
+class SessionMutex {
+  constructor() { this._chain = Promise.resolve(); }
+  acquire() {
+    let release;
+    const next = new Promise(resolve => { release = resolve; });
+    const prev = this._chain;
+    this._chain = next;
+    return prev.then(() => release);
+  }
+}
+
+function getSessionLock(sessionId) {
+  if (!sessionLocks.has(sessionId)) {
+    sessionLocks.set(sessionId, new SessionMutex());
+  }
+  return sessionLocks.get(sessionId);
+}
+
+/**
+ * Atomically read-modify-write a session under mutex.
+ * `fn` receives the fresh session and must return it (or void).
+ */
+async function withSessionLock(sessionId, fn) {
+  const lock = getSessionLock(sessionId);
+  const release = await lock.acquire();
+  try {
+    const session = getSession(sessionId);
+    if (!session) return null;
+    const result = await fn(session);
+    saveSession(session);
+    return result;
+  } finally {
+    release();
+  }
+}
 
 function abortSession(sessionId) {
   abortedSessions.add(sessionId);
@@ -122,7 +164,7 @@ function addCost(session, { ocrPages = 0, usage, model } = {}) {
   cost.outputTokens += outTok;
   cost.usd = parseFloat((cost.usd + ocrCost + chatCost).toFixed(4));
   cost.ngn = parseFloat((cost.usd * USD_TO_NGN).toFixed(2));
-  if (model === MODELS.strong) cost.strongCalls += 1;
+  if (model === MODELS.strong || model === STRONG_FALLBACK_MODEL) cost.strongCalls += 1;
   else if (model) cost.cheapCalls += 1;
 }
 
@@ -176,12 +218,29 @@ async function runOcrPdf(dataUrl) {
 
 // ── Chat JSON routing ───────────────────────────────────────────────────────
 
+function isOpenRouterAuthError(err) {
+  const msg = (err?.message || String(err)).toLowerCase();
+  return (
+    err?.status === 401 ||
+    msg.includes('401') ||
+    msg.includes('user not found') ||
+    msg.includes('unauthorized') ||
+    msg.includes('invalid api key') ||
+    msg.includes('authentication')
+  );
+}
+
 async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, label = 'chat-json' } = {}) {
   const stage = model === MODELS.strong ? 'strong' : 'cheap';
   const chatProvider = IS_HYBRID ? providerForStage(stage) : PROVIDER;
+  const wantsStrong = model === MODELS.strong || stage === 'strong';
 
   if (chatProvider === 'openrouter') {
-    if (process.env.OPENROUTER_API_KEY) {
+    if (openRouterUnavailable) {
+      console.warn(
+        `[vision] OpenRouter unavailable; using ${STRONG_FALLBACK_MODEL} for ${label}`
+      );
+    } else if (process.env.OPENROUTER_API_KEY) {
       try {
         const response = await withRetry(
           async () => openrouterProvider.chatJson(system, user, { maxTokens, model }),
@@ -189,10 +248,20 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
         );
         return { data: parseJsonContent(response.content), usage: response.usage, model: response.model };
       } catch (err) {
-        console.warn(`[vision] OpenRouter chat failed (${err.message}), falling back to Mistral`);
+        if (isOpenRouterAuthError(err)) {
+          openRouterUnavailable = true;
+          console.warn(
+            `[vision] OpenRouter auth failed (${err.message}); escalationProvider=${STRONG_FALLBACK_MODEL} (openrouter unavailable)`
+          );
+        } else {
+          console.warn(`[vision] OpenRouter chat failed (${err.message}), falling back to Mistral`);
+        }
       }
     } else {
-      console.warn('[vision] OPENROUTER_API_KEY not configured, using Mistral');
+      openRouterUnavailable = true;
+      console.warn(
+        `[vision] OPENROUTER_API_KEY not configured; escalationProvider=${STRONG_FALLBACK_MODEL} (openrouter unavailable)`
+      );
     }
   }
   if (chatProvider === 'groq') {
@@ -212,7 +281,14 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
   }
 
   const mistral = getMistral();
-  const fallbackModel = (model && model.startsWith('mistral')) ? model : 'mistral-small-latest';
+  let fallbackModel;
+  if (model && String(model).startsWith('mistral')) {
+    fallbackModel = model;
+  } else if (wantsStrong) {
+    fallbackModel = STRONG_FALLBACK_MODEL;
+  } else {
+    fallbackModel = 'mistral-small-latest';
+  }
   const response = await withRetry(
     async () =>
       mistral.chat.complete({
@@ -233,8 +309,88 @@ async function chatJson(system, user, { maxTokens = 8192, model = MODELS.cheap, 
 
 // ── Question Grouping and Ordering ──────────────────────────────────────────
 
+/**
+ * Normalize exam paper titles so POST UME / POST-UTME / POSTUME variants group together.
+ */
+function normalizePaper(paper) {
+  if (!paper) return null;
+  let p = String(paper).trim().replace(/\s+/g, ' ');
+  if (!p) return null;
+  const upper = p.toUpperCase();
+  // POSTUME / POST-UME / POST UTME / POST-UTME screening variants
+  if (/POST[\s\-]?U\.?T?\.?M\.?E/.test(upper) || /POSTUME/.test(upper.replace(/[\s\-]/g, ''))) {
+    if (/SCREENING|EXERCISE/.test(upper)) return 'POST UTME SCREENING';
+    return 'POST UTME TEST';
+  }
+  return p;
+}
+
+/**
+ * Deterministic year/paper from OCR text. Page text wins over LLM + session memory.
+ */
+function detectExamHeader(ocrMarkdown) {
+  if (!ocrMarkdown) return null;
+  const lines = String(ocrMarkdown)
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, 50);
+
+  const yearRe = /\b((?:19|20)\d{2})\b/;
+  const examHint =
+    /POST[\s\-]?U\.?T?\.?M\.?E|POSTUME|SCREENING\s+EXERCISE|SCREENING\s+TEST|UME\s+TEST|UTME/i;
+
+  for (const line of lines) {
+    if (!examHint.test(line) && !/UNIVERSITY|OBAFEMI|AWOLOWO/i.test(line)) continue;
+    const ym = line.match(yearRe);
+    if (!ym) continue;
+    const year = ym[1];
+    const yNum = Number(year);
+    if (yNum < 1990 || yNum > 2035) continue;
+
+    let paper = null;
+    if (examHint.test(line) || /UNIVERSITY|OBAFEMI|AWOLOWO/i.test(line)) {
+      // Prefer exam phrase from this line; fall back to canonical series name
+      const postMatch = line.match(
+        /POST[\s\-]?U\.?T?\.?M\.?E[\s\-]*(?:SCREENING(?:\s+(?:EXERCISE|TEST))?|TEST)?/i
+      );
+      if (postMatch) {
+        paper = normalizePaper(postMatch[0]);
+      } else if (/POSTUME/i.test(line.replace(/[\s\-]/g, ''))) {
+        paper = normalizePaper(line);
+      } else {
+        paper = 'POST UTME TEST';
+      }
+    }
+    return { year: String(year), paper };
+  }
+
+  // Broader scan: any line with year + nearby exam keyword in first 50 lines joined
+  const head = lines.join('\n');
+  const loose = head.match(
+    /\b((?:19|20)\d{2})\b[^\n]{0,40}(?:POST[\s\-]?U\.?T?\.?M\.?E|POSTUME|SCREENING)|(?:POST[\s\-]?U\.?T?\.?M\.?E|POSTUME|SCREENING)[^\n]{0,40}\b((?:19|20)\d{2})\b/i
+  );
+  if (loose) {
+    const year = loose[1] || loose[2];
+    const yNum = Number(year);
+    if (yNum >= 1990 && yNum <= 2035) {
+      return { year: String(year), paper: 'POST UTME TEST' };
+    }
+  }
+  return null;
+}
+
+function applyDetectedHeader(pageMeta, ocrMarkdown) {
+  const detected = detectExamHeader(ocrMarkdown);
+  const meta = pageMeta && typeof pageMeta === 'object' ? { ...pageMeta } : {};
+  if (detected?.year) meta.year = detected.year;
+  if (detected?.paper) meta.paper = detected.paper;
+  else if (meta.paper) meta.paper = normalizePaper(meta.paper) || meta.paper;
+  return { pageMeta: meta, detected };
+}
+
 function groupKey(year, paper) {
-  return `${year || 'Unknown'}::${paper || 'Default'}`;
+  return `${year || 'Unknown'}::${normalizePaper(paper) || paper || 'Default'}`;
 }
 
 function compareQuestions(a, b) {
@@ -267,6 +423,7 @@ function rebuildGroups(session, { renumber = false } = {}) {
   sortQuestionsInPlace(session.questions || [], { renumber });
   const map = new Map();
   for (const q of session.questions || []) {
+    if (q.paper) q.paper = normalizePaper(q.paper) || q.paper;
     const y = q.year || 'Unknown';
     const p = q.paper || 'Default';
     const key = groupKey(y, p);
@@ -305,11 +462,15 @@ function applyAnswerKeys(session) {
 
   for (const q of session.questions || []) {
     if (q.correct !== null && q.correct !== undefined) continue;
+    const qPaper = normalizePaper(q.paper) || q.paper;
     const matches = keys.filter((k) => {
       if (k.questionNumber == null || q.questionNumber == null) return false;
       if (Number(k.questionNumber) !== Number(q.questionNumber)) return false;
       if (k.year && q.year && String(k.year) !== String(q.year)) return false;
-      if (k.paper && q.paper && String(k.paper).toLowerCase() !== String(q.paper).toLowerCase()) return false;
+      const kPaper = normalizePaper(k.paper) || k.paper;
+      if (kPaper && qPaper && String(kPaper).toLowerCase() !== String(qPaper).toLowerCase()) {
+        return false;
+      }
       return true;
     });
     if (matches.length === 1) {
@@ -320,6 +481,35 @@ function applyAnswerKeys(session) {
       q.needsReview = true;
     }
   }
+}
+
+function answerKeyDedupeKey(k) {
+  const paper = normalizePaper(k.paper) || k.paper || 'Default';
+  return `${k.year || 'Unknown'}::${paper}::Q${k.questionNumber}`;
+}
+
+/** Merge answer keys into session, deduping by year::paper::Q#. */
+function mergeAnswerKeys(session, incoming) {
+  if (!incoming?.length) return 0;
+  session.answerKeys = session.answerKeys || [];
+  const byKey = new Map();
+  for (const k of session.answerKeys) {
+    if (k.questionNumber == null) continue;
+    byKey.set(answerKeyDedupeKey(k), k);
+  }
+  let added = 0;
+  for (const k of incoming) {
+    if (k.questionNumber == null) continue;
+    const key = answerKeyDedupeKey(k);
+    if (!byKey.has(key)) added += 1;
+    byKey.set(key, {
+      ...k,
+      year: k.year ? String(k.year) : null,
+      paper: normalizePaper(k.paper) || k.paper || null,
+    });
+  }
+  session.answerKeys = Array.from(byKey.values());
+  return added;
 }
 
 function detectNumberGaps(session) {
@@ -449,6 +639,7 @@ function autoAssignMissing(session, question) {
     }
   }
 
+  // Never overwrite a year/paper already set from page header / pageMeta
   if (!question.year || question.year === 'Unknown') {
     if (session.memory?.activeYear) {
       question.year = session.memory.activeYear;
@@ -457,12 +648,21 @@ function autoAssignMissing(session, question) {
 
   if (!question.paper || question.paper === 'Default') {
     if (session.memory?.activePaper) {
-      question.paper = session.memory.activePaper;
+      question.paper = normalizePaper(session.memory.activePaper) || session.memory.activePaper;
     }
+  } else {
+    question.paper = normalizePaper(question.paper) || question.paper;
   }
 }
 
 // ── Deduplication & Sequential Validation (Structural) ─────────────────────
+
+function questionQualityScore(q) {
+  const conf = typeof q.confidence === 'number' ? q.confidence : 0;
+  const opts = Array.isArray(q.options) ? q.options.filter((o) => String(o || '').trim()).length : 0;
+  const stemLen = String(q.question || '').trim().length;
+  return conf * 10 + opts * 2 + Math.min(stemLen, 200) / 50;
+}
 
 function deduplicateQuestions(session) {
   const byKey = new Map();
@@ -470,6 +670,7 @@ function deduplicateQuestions(session) {
 
   for (const q of session.questions || []) {
     if (q.questionNumber == null) continue;
+    if (q.paper) q.paper = normalizePaper(q.paper) || q.paper;
     const key = `${groupKey(q.year, q.paper)}::Q${q.questionNumber}`;
     if (!byKey.has(key)) {
       byKey.set(key, []);
@@ -480,8 +681,8 @@ function deduplicateQuestions(session) {
   for (const [, dups] of byKey) {
     if (dups.length <= 1) continue;
 
-    // Sort by confidence desc, keep the best version
-    dups.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    // Prefer richer stem/options, then confidence
+    dups.sort((a, b) => questionQualityScore(b) - questionQualityScore(a));
     const keep = dups[0];
     keep.needsReview = true;
 
@@ -543,8 +744,14 @@ function stitchContinuation(session, pageIndex, extracted) {
   let nextOrder =
     (session.questions || []).reduce((m, q) => Math.max(m, Number(q.orderIndex) || 0), 0) + 1;
 
-  if (extracted?.pageMeta?.year) memory.activeYear = String(extracted.pageMeta.year);
-  if (extracted?.pageMeta?.paper) memory.activePaper = String(extracted.pageMeta.paper);
+  const pageYear = extracted?.pageMeta?.year ? String(extracted.pageMeta.year) : null;
+  const pagePaper = extracted?.pageMeta?.paper
+    ? normalizePaper(extracted.pageMeta.paper) || String(extracted.pageMeta.paper)
+    : null;
+
+  // Only advance sticky memory when this page has an explicit header/year
+  if (pageYear) memory.activeYear = pageYear;
+  if (pagePaper) memory.activePaper = pagePaper;
   if (extracted?.pageMeta?.subject) memory.activeSubject = String(extracted.pageMeta.subject);
 
   let list = Array.isArray(extracted?.questions) ? [...extracted.questions] : [];
@@ -592,8 +799,14 @@ function stitchContinuation(session, pageIndex, extracted) {
       return;
     }
 
-    const year = raw.year || extracted?.pageMeta?.year || memory.activeYear || null;
-    const paper = raw.paper || extracted?.pageMeta?.paper || memory.activePaper || null;
+    // Prefer per-question → pageMeta (header) → memory fallback (continuations only)
+    const year = raw.year || pageYear || memory.activeYear || null;
+    const paper =
+      normalizePaper(raw.paper) ||
+      pagePaper ||
+      normalizePaper(memory.activePaper) ||
+      memory.activePaper ||
+      null;
     const subject = raw.subject || extracted?.pageMeta?.subject || memory.activeSubject || session.subjectHint || 'General';
     const id = nextId++;
     const orderIndex = nextOrder++;
@@ -621,8 +834,8 @@ function stitchContinuation(session, pageIndex, extracted) {
 
     autoAssignMissing(session, q);
 
-    if (memory.activeYear == null && year) memory.activeYear = String(year);
-    if (memory.activePaper == null && paper) memory.activePaper = String(paper);
+    if (memory.activeYear == null && q.year) memory.activeYear = String(q.year);
+    if (memory.activePaper == null && q.paper) memory.activePaper = String(q.paper);
     if (memory.activeSubject == null && subject && subject !== 'General') memory.activeSubject = subject;
 
     if (q.questionNumber != null) {
@@ -647,8 +860,8 @@ function stitchContinuation(session, pageIndex, extracted) {
       options: normalizeOptions(carry.options),
       correct: carry.correct ?? null,
       explanation: carry.explanation || '',
-      year: carry.year || memory.activeYear,
-      paper: carry.paper || memory.activePaper,
+      year: carry.year || pageYear || memory.activeYear,
+      paper: normalizePaper(carry.paper) || pagePaper || memory.activePaper,
       questionNumber: carry.questionNumber ?? null,
       pageIndex,
       incomplete: true,
@@ -680,196 +893,242 @@ async function extractAnswerKey(ocrMarkdown, memory) {
   return { data, usage, model };
 }
 
-async function processOnePage(session, pageObj) {
-  const page = session.pages.find((p) => p.id === pageObj.id) || session.pages[pageObj.index] || pageObj;
-  page.status = 'processing';
-  page.retryCount = page.retryCount || 0;
-  page.modelPath = page.modelPath || 'cheap';
-  saveSession(session);
+/**
+ * Pure per-page extraction (no shared-session mutation).
+ * Returns a pageResult for the worker to merge under withSessionLock.
+ */
+async function executePageExtraction(
+  sessionId,
+  pageRef,
+  ocrMarkdown,
+  pageIndex,
+  subjectHint,
+  memorySnapshot
+) {
+  const pageNum = (pageRef?.index ?? pageIndex ?? 0) + 1;
+  const memory = memorySnapshot || {};
+  const costAcc = { entries: [] };
 
-  let ocrMarkdown = page.ocrMarkdown || '';
+  const trackCost = ({ usage, model, ocrPages = 0 }) => {
+    costAcc.entries.push({ usage, model, ocrPages });
+  };
 
-  // Step 1: High-fidelity OCR via dedicated engine
-  if (!ocrMarkdown) {
-    const ocrProv = IS_HYBRID ? 'mistral' : PROVIDER;
-    console.log(`[vision:ocr] Page ${page.index + 1}/${session.pages.length}: Running OCR via ${ocrProv} ${MODELS.ocr}...`);
-    if (!page.dataUrl && !page.imagePath) {
-      throw new Error('Page has no image or OCR text');
+  try {
+    let md = ocrMarkdown || '';
+
+    if (!md || md.length < 8) {
+      console.log(`[vision:skip] Page ${pageNum} is empty/blank (<8 chars), skipping.`);
+      return {
+        pageType: 'blank',
+        classifyConfidence: 0.99,
+        skipStatus: 'skipped',
+        skipReason: 'blank_or_negligible_text',
+        questionCount: 0,
+        costEntries: costAcc.entries,
+      };
     }
-    let dataUrl = page.dataUrl;
-    if (!dataUrl && page.imagePath) {
-      const fs = await import('node:fs');
-      const buf = fs.readFileSync(page.imagePath);
-      dataUrl = `data:image/jpeg;base64,${buf.toString('base64')}`;
+
+    const heuristic = heuristicPageType(md);
+    if (heuristic) {
+      console.log(`[vision:heuristic] Page ${pageNum} skipped: ${heuristic.reason}`);
+      return {
+        pageType: heuristic.pageType,
+        classifyConfidence: heuristic.confidence,
+        skipStatus: 'skipped',
+        skipReason: heuristic.reason,
+        questionCount: 0,
+        costEntries: costAcc.entries,
+      };
     }
-    const ocrResponse = await runOcrImage(dataUrl);
-    ocrMarkdown = (ocrResponse.pages || [])
-      .map((p) => p.markdown || '')
-      .filter(Boolean)
-      .join('\n\n')
-      .trim();
-    const ocrPages =
-      ocrResponse.usageInfo?.pagesProcessed ??
-      ocrResponse.usage_info?.pages_processed ??
-      (ocrResponse.pages?.length || 1);
-    addCost(session, { ocrPages });
-    page.ocrMarkdown = ocrMarkdown;
-    delete page.dataUrl;
-    console.log(`[vision:ocr] Page ${page.index + 1}: OCR extracted ${ocrMarkdown.length} characters.`);
-  }
 
-  if (!ocrMarkdown || ocrMarkdown.length < 8) {
-    page.status = 'skipped';
-    page.pageType = 'blank';
-    console.log(`[vision:skip] Page ${page.index + 1} is empty/blank (<8 chars), skipping.`);
-    return;
-  }
-
-  const heuristic = heuristicPageType(ocrMarkdown);
-  if (heuristic) {
-    page.pageType = heuristic.pageType;
-    page.classifyConfidence = heuristic.confidence;
-    page.status = 'skipped';
-    page.skipReason = heuristic.reason;
-    console.log(`[vision:heuristic] Page ${page.index + 1} skipped: ${heuristic.reason}`);
-    return;
-  }
-
-  // Step 2: High-Speed Unified Extraction & Subject Reasoning (Single LLM pass)
-  const effectiveSubjectHint =
-    session.memory.activeSubject || session.subjectHint || null;
-
-  console.log(`[vision:extract] Page ${page.index + 1}: Extracting questions with Mistral Small (subjectHint=${effectiveSubjectHint || 'auto'})...`);
-  let { data: extracted, usage: eUsage, model: eModel } = await extractQuestions(
-    ocrMarkdown,
-    session.memory,
-    effectiveSubjectHint,
-    MODELS.cheap
-  );
-  addCost(session, { usage: eUsage, model: eModel });
-
-  const pageMeta = extracted?.pageMeta || {};
-  const pageType = pageMeta.pageType || (extracted?.questions?.length > 0 ? 'question_content' : 'blank');
-  page.pageType = pageType;
-  page.classifyConfidence = pageMeta.confidence ?? 0.9;
-
-  console.log(
-    `[vision:classify] Page ${page.index + 1}: type="${pageType}", confidence=${page.classifyConfidence}, year=${pageMeta.year || '?'}, paper=${pageMeta.paper || '?'}, subject=${pageMeta.subject || '?'}`
-  );
-
-  if (pageMeta.year) {
-    session.memory.activeYear = String(pageMeta.year);
-    session.memory.lastHeadings = [
-      ...(session.memory.lastHeadings || []).slice(-9),
-      `year:${pageMeta.year}`,
-    ];
-  }
-  if (pageMeta.paper) {
-    session.memory.activePaper = String(pageMeta.paper);
-    session.memory.lastHeadings = [
-      ...(session.memory.lastHeadings || []).slice(-9),
-      `paper:${pageMeta.paper}`,
-    ];
-  }
-  if (pageMeta.subject) {
-    session.memory.activeSubject = String(pageMeta.subject);
-    session.memory.lastHeadings = [
-      ...(session.memory.lastHeadings || []).slice(-9),
-      `subject:${pageMeta.subject}`,
-    ];
-  }
-
-  if (pageType === 'blank' || pageType === 'cover_toc') {
-    page.status = 'skipped';
-    console.log(`[vision:skip] Page ${page.index + 1} marked as ${pageType}, skipped.`);
-    return;
-  }
-
-  if (pageType === 'unclear') {
-    page.status = 'needs_input';
-    const fu = {
-      id: `unclear-${page.id}`,
-      type: 'unclear_image',
-      message: `Page ${page.index + 1} is too blurry or damaged. Please upload a clearer photo of this page.`,
-      pageId: page.id,
-      meta: { pageIndex: page.index },
-    };
-    mergeFollowUps(session, [fu]);
-    page.followUpId = fu.id;
-    console.warn(`[vision:unclear] Page ${page.index + 1} marked as needs_input (unclear).`);
-    return;
-  }
-
-  if (pageType === 'answer_key') {
-    session.memory.answersSectionStarted = true;
-    console.log(`[vision:answers] Page ${page.index + 1}: Parsing answer keys...`);
-    const { data: answers, usage: aUsage, model: aModel } = await extractAnswerKey(
-      ocrMarkdown,
-      session.memory
+    const effectiveSubjectHint = memory.activeSubject || subjectHint || null;
+    console.log(
+      `[vision:extract] Page ${pageNum}: Extracting questions with Mistral Small (subjectHint=${effectiveSubjectHint || 'auto'})...`
     );
-    addCost(session, { usage: aUsage, model: aModel });
-    const year = answers.year || session.memory.activeYear;
-    const paper = answers.paper || session.memory.activePaper;
-    for (const a of answers.answers || []) {
-      session.answerKeys.push({
-        questionNumber: a.questionNumber,
-        correctLetter: a.correctLetter,
-        correctIndex: a.correctIndex != null ? a.correctIndex : letterToIndex(a.correctLetter),
-        year: year ? String(year) : null,
-        paper: paper ? String(paper) : null,
-        pageIndex: page.index,
-      });
-    }
-    mergeFollowUps(
-      session,
-      (answers.followUps || []).map((f) => ({ ...f, pageId: page.id }))
-    );
-    applyAnswerKeys(session);
-    page.status = 'done';
-    console.log(`[vision:answers] Page ${page.index + 1}: Saved ${answers.answers?.length || 0} answer keys.`);
-    return;
-  }
 
-  // Step 3: Selective Escalation to Strong Reasoning Model if required
-  const gate = needsStrongExtract(ocrMarkdown, pageMeta, extracted);
-  if (gate.yes) {
-    console.log(`[escalate] Page ${page.index + 1}: Escalating due to "${gate.reason}"`);
-    ensureCost(session).escalations += 1;
-    page.modelPath = 'strong';
-    page.escalateReason = gate.reason;
-    const strong = await extractQuestions(
-      ocrMarkdown,
-      session.memory,
+    let { data: extracted, usage: eUsage, model: eModel } = await extractQuestions(
+      md,
+      memory,
       effectiveSubjectHint,
-      MODELS.strong
+      MODELS.cheap
     );
-    addCost(session, { usage: strong.usage, model: strong.model });
-    extracted = strong.data;
-  }
+    trackCost({ usage: eUsage, model: eModel });
 
-  // Step 4: Stitching & Session Assembly
-  const stitched = stitchContinuation(session, page.index, extracted);
-  for (const q of stitched) {
-    if (!session.questions.some((x) => x.id === q.id)) {
-      session.questions.push(q);
-    } else {
-      const idx = session.questions.findIndex((x) => x.id === q.id);
-      session.questions[idx] = { ...session.questions[idx], ...q };
+    if (extracted?.reasoning) {
+      console.log(
+        `[vision:reasoning] Page ${pageNum}:\n  ${String(extracted.reasoning).split('\n').join('\n  ')}`
+      );
     }
+
+    let pageMeta = extracted?.pageMeta || {};
+    const { pageMeta: overridden, detected } = applyDetectedHeader(pageMeta, md);
+    pageMeta = overridden;
+    if (extracted) extracted.pageMeta = pageMeta;
+    if (detected?.year) {
+      console.log(
+        `[vision:header] Page ${pageNum}: OCR header year=${detected.year} paper=${detected.paper || '?'}`
+      );
+    }
+
+    const pageType =
+      pageMeta.pageType || (extracted?.questions?.length > 0 ? 'question_content' : 'blank');
+    const classifyConfidence = pageMeta.confidence ?? 0.9;
+
+    console.log(
+      `[vision:classify] Page ${pageNum}: type="${pageType}", confidence=${classifyConfidence}, year=${pageMeta.year || '?'}, paper=${pageMeta.paper || '?'}, subject=${pageMeta.subject || '?'}`
+    );
+
+    const memoryUpdates = {};
+    if (pageMeta.year) {
+      memoryUpdates.activeYear = String(pageMeta.year);
+      memoryUpdates.lastHeadings = [`year:${pageMeta.year}`];
+    }
+    if (pageMeta.paper) {
+      memoryUpdates.activePaper = normalizePaper(pageMeta.paper) || String(pageMeta.paper);
+      memoryUpdates.lastHeadings = [
+        ...(memoryUpdates.lastHeadings || []),
+        `paper:${memoryUpdates.activePaper}`,
+      ];
+    }
+    if (pageMeta.subject) {
+      memoryUpdates.activeSubject = String(pageMeta.subject);
+      memoryUpdates.lastHeadings = [
+        ...(memoryUpdates.lastHeadings || []),
+        `subject:${pageMeta.subject}`,
+      ];
+    }
+
+    if (pageType === 'blank' || pageType === 'cover_toc') {
+      console.log(`[vision:skip] Page ${pageNum} marked as ${pageType}, skipped.`);
+      return {
+        pageType,
+        classifyConfidence,
+        skipStatus: 'skipped',
+        memoryUpdates,
+        questionCount: 0,
+        costEntries: costAcc.entries,
+      };
+    }
+
+    if (pageType === 'unclear') {
+      console.warn(`[vision:unclear] Page ${pageNum} marked as needs_input (unclear).`);
+      const fu = {
+        id: `unclear-${pageRef.id}`,
+        type: 'unclear_image',
+        message: `Page ${pageNum} is too blurry or damaged. Please upload a clearer photo of this page.`,
+        meta: { pageIndex },
+      };
+      return {
+        pageType,
+        classifyConfidence,
+        skipStatus: 'needs_input',
+        followUps: [fu],
+        followUpId: fu.id,
+        memoryUpdates,
+        questionCount: 0,
+        costEntries: costAcc.entries,
+      };
+    }
+
+    if (pageType === 'answer_key') {
+      memoryUpdates.answersSectionStarted = true;
+      console.log(`[vision:answers] Page ${pageNum}: Parsing answer keys...`);
+      const { data: answers, usage: aUsage, model: aModel } = await extractAnswerKey(md, memory);
+      trackCost({ usage: aUsage, model: aModel });
+
+      if (answers?.reasoning) {
+        console.log(
+          `[vision:answers:reasoning] Page ${pageNum}:\n  ${String(answers.reasoning).split('\n').join('\n  ')}`
+        );
+      }
+
+      const header = detectExamHeader(md);
+      const year =
+        header?.year ||
+        answers?.year ||
+        pageMeta.year ||
+        memory.activeYear ||
+        null;
+      const paper =
+        header?.paper ||
+        normalizePaper(answers?.paper) ||
+        normalizePaper(pageMeta.paper) ||
+        normalizePaper(memory.activePaper) ||
+        memory.activePaper ||
+        null;
+
+      if (year) memoryUpdates.activeYear = String(year);
+      if (paper) memoryUpdates.activePaper = String(paper);
+
+      const answerKeys = [];
+      for (const a of answers?.answers || []) {
+        answerKeys.push({
+          questionNumber: a.questionNumber,
+          correctLetter: a.correctLetter,
+          correctIndex: a.correctIndex != null ? a.correctIndex : letterToIndex(a.correctLetter),
+          year: year ? String(year) : null,
+          paper: paper ? String(paper) : null,
+          pageIndex,
+        });
+      }
+
+      console.log(`[vision:answers] Page ${pageNum}: Saved ${answerKeys.length} answer keys.`);
+      return {
+        pageType,
+        classifyConfidence,
+        answerKeys,
+        memoryUpdates,
+        followUps: answers?.followUps || [],
+        questionCount: 0,
+        costEntries: costAcc.entries,
+      };
+    }
+
+    // Selective escalation
+    let modelPath = 'cheap';
+    let escalateReason = null;
+    const gate = needsStrongExtract(md, pageMeta, extracted);
+    if (gate.yes) {
+      console.log(`[escalate] Page ${pageNum}: Escalating due to "${gate.reason}"`);
+      modelPath = 'strong';
+      escalateReason = gate.reason;
+      const strong = await extractQuestions(md, memory, effectiveSubjectHint, MODELS.strong);
+      trackCost({ usage: strong.usage, model: strong.model });
+      extracted = strong.data;
+      // Re-apply header override after strong extract
+      if (extracted) {
+        const re = applyDetectedHeader(extracted.pageMeta || pageMeta, md);
+        extracted.pageMeta = re.pageMeta;
+        pageMeta = re.pageMeta;
+        if (re.detected?.year) memoryUpdates.activeYear = String(re.detected.year);
+        if (re.detected?.paper) memoryUpdates.activePaper = re.detected.paper;
+      }
+    }
+
+    return {
+      pageType,
+      classifyConfidence,
+      extracted,
+      memoryUpdates,
+      followUps: extracted?.followUps || [],
+      questionCount: extracted?.questions?.length || 0,
+      escalateReason,
+      modelPath,
+      costEntries: costAcc.entries,
+    };
+  } catch (err) {
+    return {
+      error: err?.message || String(err),
+      questionCount: 0,
+      costEntries: costAcc.entries,
+    };
   }
+}
 
-  mergeFollowUps(
-    session,
-    (extracted.followUps || []).map((f) => ({ ...f, pageId: page.id }))
-  );
-
-  applyAnswerKeys(session);
-  deduplicateQuestions(session);
-  rebuildGroups(session);
-  page.status = 'done';
-  console.log(
-    `[vision:done] Page ${page.index + 1} DONE: ${extracted.questions?.length || 0} question(s) parsed. Session total: ${session.questions.length} questions across ${session.groups.length} group(s).`
-  );
+function applyCostEntries(session, entries) {
+  for (const e of entries || []) {
+    addCost(session, e);
+  }
 }
 
 function trimMemory(session) {
@@ -929,9 +1188,30 @@ async function runSessionWorker(sessionId) {
     }
 
     session.status = 'processing';
+
+    // Recover orphaned pages left in 'processing' after crashes / incomplete runs
+    let recovered = 0;
+    for (const p of session.pages || []) {
+      if (p.status === 'processing') {
+        p.status = 'pending';
+        recovered += 1;
+      }
+    }
+    if (recovered) {
+      console.warn(`[vision] Recovered ${recovered} orphaned processing page(s) → pending`);
+    }
+    updateProgress(session);
     saveSession(session);
+
     const providerLabel = IS_HYBRID ? `hybrid(mistral+openrouter)` : PROVIDER;
-    console.log(`[vision] worker start ${sessionId} pages=${session.pages.length} provider=${providerLabel}`);
+    const escalateNote = openRouterUnavailable
+      ? `escalationProvider=${STRONG_FALLBACK_MODEL} (openrouter unavailable)`
+      : IS_HYBRID
+        ? `escalation=openrouter→${MODELS.strong} (fallback ${STRONG_FALLBACK_MODEL})`
+        : '';
+    console.log(
+      `[vision] worker start ${sessionId} pages=${session.pages.length} provider=${providerLabel} concurrency=${CONCURRENCY}${escalateNote ? ' ' + escalateNote : ''}`
+    );
 
     const sem = new Semaphore(CONCURRENCY);
     let consecutiveFailures = 0;
@@ -942,80 +1222,185 @@ async function runSessionWorker(sessionId) {
         console.log(`[vision] Session ${sessionId} was aborted, stopping worker.`);
         return;
       }
-      session = getSession(sessionId);
-      if (!session) break;
 
       if (circuitBroken) {
+        await withSessionLock(sessionId, (s) => {
+          mergeFollowUps(s, [{
+            id: `circuit-${sessionId}-${Date.now()}`,
+            type: 'circuit_breaker',
+            status: 'open',
+            message: `Processing paused after ${CIRCUIT_BREAKER_THRESHOLD} consecutive failures. Please check your API keys/credits and resume.`,
+            meta: { consecutiveFailures },
+          }]);
+        });
         console.error(`[circuit-breaker] ${sessionId}: ${CIRCUIT_BREAKER_THRESHOLD} consecutive failures — pausing`);
-        mergeFollowUps(session, [{
-          id: `circuit-${sessionId}-${Date.now()}`,
-          type: 'circuit_breaker',
-          status: 'open',
-          message: `Processing paused after ${CIRCUIT_BREAKER_THRESHOLD} consecutive failures. Please check your API keys/credits and resume.`,
-          meta: { consecutiveFailures },
-        }]);
-        saveSession(session);
         break;
       }
 
-      const pendingPages = session.pages.filter((p) => p.status === 'pending');
-      if (!pendingPages.length) break;
+      // ── Atomically pick and mark batch pages as 'processing' ──────────
+      // This prevents any page from being picked up twice by concurrent iterations.
+      const batch = await withSessionLock(sessionId, (s) => {
+        const pending = s.pages.filter((p) => p.status === 'pending');
+        if (!pending.length) return [];
+        const picked = pending.slice(0, CONCURRENCY);
+        for (const p of picked) {
+          const target = s.pages.find((sp) => sp.id === p.id);
+          if (target) target.status = 'processing';
+        }
+        return picked.map((p) => ({ id: p.id, index: p.index }));
+      });
 
-      const batch = pendingPages.slice(0, CONCURRENCY);
-      const promises = batch.map(async (page) => {
+      if (!batch || !batch.length) break;
+
+      const promises = batch.map(async (pageRef) => {
         if (abortedSessions.has(sessionId)) return;
         await sem.acquire();
         try {
           if (abortedSessions.has(sessionId)) return;
-          const freshSession = getSession(sessionId);
-          if (!freshSession || abortedSessions.has(sessionId)) return;
 
-          await processOnePage(freshSession, page);
-          if (abortedSessions.has(sessionId)) return;
-          consecutiveFailures = 0;
+          // ── Read the memory snapshot & page data under lock ──────────
+          const { ocrMarkdown, pageIndex, subjectHint, memorySnapshot } =
+            await withSessionLock(sessionId, (s) => {
+              const pg = s.pages.find((p) => p.id === pageRef.id) || s.pages[pageRef.index];
+              if (!pg) return null;
+              pg.retryCount = pg.retryCount || 0;
+              pg.modelPath = pg.modelPath || 'cheap';
+              return {
+                ocrMarkdown: pg.ocrMarkdown || '',
+                pageIndex: pg.index,
+                subjectHint: s.memory?.activeSubject || s.subjectHint || null,
+                memorySnapshot: JSON.parse(JSON.stringify(s.memory || {})),
+              };
+            }) || {};
 
-          trimMemory(freshSession);
-          updateProgress(freshSession);
-          rebuildGroups(freshSession);
-          saveSession(freshSession);
+          if (ocrMarkdown === undefined) return; // page disappeared
 
-          // Progressive Supabase Sync
-          syncSessionToSupabase(freshSession).catch((err) =>
-            console.warn('[supabase-sync] progressive sync error:', err.message)
+          // ── Execute the slow LLM call OUTSIDE the lock ────────────
+          // This is the critical design: the API call takes seconds,
+          // so we don't hold the mutex during it.
+          const pageResult = await executePageExtraction(
+            sessionId, pageRef, ocrMarkdown, pageIndex, subjectHint, memorySnapshot
           );
-        } catch (err) {
-          console.error(`[vision:error] Page ${page.index + 1} error:`, err?.message || err);
-          const s = getSession(sessionId);
-          if (!s) return;
 
-          const targetPage = s.pages.find((p) => p.id === page.id) || s.pages[page.index] || page;
-          targetPage.retryCount = (targetPage.retryCount || 0) + 1;
-          targetPage.error = err?.message || String(err);
+          if (abortedSessions.has(sessionId)) return;
 
-          if (targetPage.retryCount <= MAX_RETRIES) {
-            targetPage.status = 'pending';
-            const delay = Math.min(30000, 1000 * Math.pow(2, targetPage.retryCount));
-            console.warn(`[vision:retry] Page ${page.index + 1} failed. Retrying in ${delay}ms (attempt ${targetPage.retryCount}/${MAX_RETRIES})...`);
-            await sleep(delay);
-          } else {
-            targetPage.status = 'failed';
-            consecutiveFailures++;
-            console.error(`[vision:failed] Page ${page.index + 1} failed permanently after ${MAX_RETRIES} attempts.`);
-            if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
-              circuitBroken = true;
+          // ── Merge results back into session UNDER lock ────────────
+          await withSessionLock(sessionId, (s) => {
+            const pg = s.pages.find((p) => p.id === pageRef.id) || s.pages[pageRef.index];
+            if (!pg) return;
+
+            if (pageResult.error) {
+              applyCostEntries(s, pageResult.costEntries);
+              pg.retryCount = (pg.retryCount || 0) + 1;
+              pg.error = pageResult.error;
+              if (pg.retryCount <= MAX_RETRIES) {
+                pg.status = 'pending'; // will be retried in next iteration
+                console.warn(`[vision:retry] Page ${pageRef.index + 1} failed. Will retry (attempt ${pg.retryCount}/${MAX_RETRIES}): ${pageResult.error}`);
+              } else {
+                pg.status = 'failed';
+                consecutiveFailures++;
+                console.error(`[vision:failed] Page ${pageRef.index + 1} failed permanently after ${MAX_RETRIES} attempts.`);
+                if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) circuitBroken = true;
+                mergeFollowUps(s, [{
+                  id: `fail-${pg.id}`,
+                  type: 'page_failed',
+                  message: `Page ${pageRef.index + 1} failed after retries: ${pg.error}. You can resume to retry or replace this page.`,
+                  pageId: pg.id,
+                }]);
+              }
+            } else {
+              consecutiveFailures = 0;
+
+              applyCostEntries(s, pageResult.costEntries);
+              if (pageResult.escalateReason) {
+                ensureCost(s).escalations += 1;
+              }
+
+              // Apply all the results that processOnePage used to do
+              pg.pageType = pageResult.pageType;
+              pg.classifyConfidence = pageResult.classifyConfidence;
+              pg.ocrMarkdown = pageResult.ocrMarkdownUpdate || pg.ocrMarkdown;
+              if (pageResult.modelPath) pg.modelPath = pageResult.modelPath;
+              if (pageResult.escalateReason) pg.escalateReason = pageResult.escalateReason;
+
+              // Update memory from page results (in-page year/paper always win when present)
+              if (pageResult.memoryUpdates) {
+                const mu = pageResult.memoryUpdates;
+                if (mu.activeYear) s.memory.activeYear = mu.activeYear;
+                if (mu.activePaper) s.memory.activePaper = mu.activePaper;
+                if (mu.activeSubject) s.memory.activeSubject = mu.activeSubject;
+                if (mu.answersSectionStarted) s.memory.answersSectionStarted = true;
+                if (mu.lastHeadings) {
+                  s.memory.lastHeadings = [
+                    ...(s.memory.lastHeadings || []).slice(-5),
+                    ...mu.lastHeadings,
+                  ].slice(-10);
+                }
+              }
+
+              // Merge answer keys (deduped by year::paper::Q#)
+              if (pageResult.answerKeys?.length) {
+                mergeAnswerKeys(s, pageResult.answerKeys);
+              }
+
+              // Merge questions via stitchContinuation
+              if (pageResult.extracted && pageResult.pageType !== 'answer_key') {
+                const stitched = stitchContinuation(s, pg.index, pageResult.extracted);
+                for (const q of stitched) {
+                  if (!s.questions.some((x) => x.id === q.id)) {
+                    s.questions.push(q);
+                  } else {
+                    const idx = s.questions.findIndex((x) => x.id === q.id);
+                    s.questions[idx] = { ...s.questions[idx], ...q };
+                  }
+                }
+              }
+
+              // Merge follow-ups
+              if (pageResult.followUps?.length) {
+                mergeFollowUps(s, pageResult.followUps.map((f) => ({ ...f, pageId: pg.id })));
+              }
+
+              applyAnswerKeys(s);
+              deduplicateQuestions(s);
+              rebuildGroups(s);
+              pg.status = pageResult.skipStatus || 'done';
+              if (pageResult.skipReason) pg.skipReason = pageResult.skipReason;
+              if (pageResult.followUpId) pg.followUpId = pageResult.followUpId;
             }
-            mergeFollowUps(s, [
-              {
-                id: `fail-${targetPage.id}`,
-                type: 'page_failed',
-                message: `Page ${page.index + 1} failed after retries: ${targetPage.error}. You can resume to retry or replace this page.`,
-                pageId: targetPage.id,
-              },
-            ]);
+
+            trimMemory(s);
+            updateProgress(s);
+            rebuildGroups(s);
+          });
+
+          // Progressive Supabase sync (fire and forget, outside lock)
+          const latestSession = getSession(sessionId);
+          if (latestSession) {
+            syncSessionToSupabase(latestSession).catch((err) =>
+              console.warn('[supabase-sync] progressive sync error:', err.message)
+            );
           }
 
-          updateProgress(s);
-          saveSession(s);
+          console.log(
+            `[vision:done] Page ${pageRef.index + 1} DONE: ${pageResult.questionCount || 0} question(s) parsed. Session total: ${(getSession(sessionId)?.questions || []).length} questions across ${(getSession(sessionId)?.groups || []).length} group(s).`
+          );
+        } catch (err) {
+          console.error(`[vision:error] Page ${pageRef.index + 1} error:`, err?.message || err);
+          await withSessionLock(sessionId, (s) => {
+            const pg = s.pages.find((p) => p.id === pageRef.id) || s.pages[pageRef.index];
+            if (!pg) return;
+            pg.retryCount = (pg.retryCount || 0) + 1;
+            pg.error = err?.message || String(err);
+            if (pg.retryCount <= MAX_RETRIES) {
+              pg.status = 'pending';
+            } else {
+              pg.status = 'failed';
+              consecutiveFailures++;
+              if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) circuitBroken = true;
+            }
+            updateProgress(s);
+          });
         } finally {
           sem.release();
         }
@@ -1027,6 +1412,14 @@ async function runSessionWorker(sessionId) {
     session = getSession(sessionId);
     if (!session) return;
 
+    // Any leftover 'processing' pages are incomplete — mark failed so status is honest
+    for (const p of session.pages || []) {
+      if (p.status === 'processing') {
+        p.status = 'failed';
+        p.error = p.error || 'Left in processing when worker exited';
+      }
+    }
+
     mergeFollowUps(session, detectNumberGaps(session));
     mergeFollowUps(session, detectCountAnomalies(session));
     mergeFollowUps(session, validateQuestionSequence(session));
@@ -1036,11 +1429,12 @@ async function runSessionWorker(sessionId) {
     trimMemory(session);
     updateProgress(session);
 
-    const hasPending = session.pages.some((p) => p.status === 'pending' || p.status === 'processing');
+    const hasPending = session.pages.some((p) => p.status === 'pending');
+    const hasProcessing = session.pages.some((p) => p.status === 'processing');
     const hasNeeds = session.pages.some((p) => p.status === 'needs_input');
     const hasFailed = session.pages.some((p) => p.status === 'failed');
 
-    if (hasPending) {
+    if (hasPending || hasProcessing) {
       session.status = 'processing';
     } else if (hasNeeds) {
       session.status = 'needs_input';

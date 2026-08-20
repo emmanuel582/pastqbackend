@@ -15,6 +15,15 @@ import { runOcrPdf, runSessionWorker, addCost } from '../services/vision/process
 
 const pdfPath = process.argv[2] || "C:\\Users\\DELL\\Downloads\\Result\\oaubio.pdf";
 
+function assert(condition, message, failures) {
+  if (!condition) {
+    failures.push(message);
+    console.error(`[FAIL] ${message}`);
+  } else {
+    console.log(`[OK]   ${message}`);
+  }
+}
+
 async function main() {
   console.log("================================================================================");
   console.log(" PastQ Local Vision Pipeline E2E Test");
@@ -75,14 +84,24 @@ async function main() {
   await runSessionWorker(sessionId);
 
   const finalSession = getSession(sessionId);
+  const progress = finalSession.progress || {};
+  const accounted =
+    (progress.done || 0) + (progress.skipped || 0) + (progress.failed || 0);
+  const answerKeyPages = (finalSession.pages || []).filter((p) => p.pageType === 'answer_key').length;
+  const years = [...new Set((finalSession.questions || []).map((q) => String(q.year)).filter((y) => /^\d{4}$/.test(y)))].sort();
+  const groups = finalSession.groups || [];
+
   console.log("\n================================================================================");
   console.log(" EXTRACTION RESULTS & SUMMARY");
   console.log("================================================================================");
   console.log(`Status:            ${finalSession.status}`);
-  console.log(`Pages Processed:   ${finalSession.progress.done}/${finalSession.progress.total} (Skipped: ${finalSession.progress.skipped}, Failed: ${finalSession.progress.failed})`);
+  console.log(`Pages Processed:   ${progress.done}/${progress.total} (Skipped: ${progress.skipped}, Failed: ${progress.failed})`);
+  console.log(`Pages Accounted:   ${accounted}/${progress.total}`);
   console.log(`Total Questions:   ${finalSession.questions.length}`);
   console.log(`Answer Keys Found: ${finalSession.answerKeys?.length || 0}`);
-  console.log(`Question Groups:   ${(finalSession.groups || []).map(g => `${g.year} ${g.paper || ''} (${g.count} qs)`).join(', ')}`);
+  console.log(`Answer-key pages:  ${answerKeyPages}`);
+  console.log(`Question Groups:   ${groups.map(g => `${g.year} ${g.paper || ''} (${g.count} qs)`).join(', ')}`);
+  console.log(`Years detected:    ${years.join(', ') || '(none)'}`);
 
   console.log("\n--- [Sample 3 Extracted Questions] ---");
   const sample = (finalSession.questions || []).slice(0, 3);
@@ -99,13 +118,61 @@ async function main() {
         console.log(`    ${letter}. ${opt}${isCorrect}`);
       });
     }
-    console.log(`  Correct Index: ${q.correct !== null ? q.correct : 'N/A'}`);
+    console.log(`  Correct Index: ${q.correct !== null && q.correct !== undefined ? q.correct : 'N/A'}`);
     if (q.explanation) {
       console.log(`  Explanation: ${q.explanation}`);
     }
   });
 
+  console.log("\n--- [Assertions] ---");
+  const failures = [];
+  const okStatus =
+    finalSession.status === 'completed' || finalSession.status === 'completed_with_errors';
+  assert(okStatus, `status is completed|completed_with_errors (got ${finalSession.status})`, failures);
+  assert(
+    accounted === progress.total,
+    `all pages accounted (done+skipped+failed=${accounted} total=${progress.total})`,
+    failures
+  );
+  assert(
+    !(finalSession.pages || []).some((p) => p.status === 'pending' || p.status === 'processing'),
+    'no leftover pending/processing pages',
+    failures
+  );
+  assert(finalSession.questions.length > 0, 'extracted at least 1 question', failures);
+
+  if (answerKeyPages > 0) {
+    assert(
+      (finalSession.answerKeys?.length || 0) > 0,
+      `answer keys persisted when ${answerKeyPages} answer_key page(s) exist`,
+      failures
+    );
+  }
+
+  // Soft checks for the known OAU biology multi-year PDF
+  const isOauBio = /oaubio/i.test(path.basename(pdfPath));
+  if (isOauBio) {
+    assert(
+      finalSession.questions.length >= 150,
+      `OAU bio: >=150 questions (got ${finalSession.questions.length})`,
+      failures
+    );
+    const yearSet = new Set(years);
+    const expectedYears = ['2006', '2007', '2008', '2009', '2010', '2011', '2012', '2013'];
+    const hit = expectedYears.filter((y) => yearSet.has(y));
+    assert(
+      hit.length >= 7,
+      `OAU bio: >=7 of years 2006-2013 (got ${hit.length}: ${hit.join(', ')})`,
+      failures
+    );
+  }
+
   console.log("\n================================================================================");
+  if (failures.length) {
+    console.log(` TESTS FAILED (${failures.length})`);
+    console.log("================================================================================");
+    process.exit(1);
+  }
   console.log(" All Tests Passed Successfully!");
   console.log("================================================================================");
 }

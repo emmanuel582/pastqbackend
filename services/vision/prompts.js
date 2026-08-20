@@ -14,6 +14,7 @@ Your mission is to analyze the provided page OCR transcription, classify the pag
 
 Return JSON ONLY:
 {
+  "reasoning": "Step-by-step reasoning explaining page classification, subject deduction, noise rejection, and any complex formatting decisions.",
   "pageMeta": {
     "pageType": "question_content" | "answer_key" | "cover_toc" | "unclear" | "blank",
     "year": string|null,
@@ -31,6 +32,7 @@ Return JSON ONLY:
       "options": string[],
       "correct": number|null,
       "explanation": string,
+      "reasoning": "Brief reasoning for math formatting, noise filtering, or complex structure for this specific question",
       "confidence": number,
       "needsReview": boolean,
       "isContinuation": boolean,
@@ -79,9 +81,10 @@ CRITICAL EXTRACTION & FORMATTING RULES:
      * Chemical equations: $\\text{H}_2\\text{SO}_4$, $\\text{CaCO}_3 \\rightarrow \\text{CaO} + \\text{CO}_2$, $\\text{Na}^+ + \\text{Cl}^-$
      * Inequalities & Sets: $x \\le 5$, $\\alpha \\pm \\beta$, $A \\cap B$, $x \\in \\mathbb{R}$
 
-3. INTELLIGENT SUBJECT IDENTIFICATION:
+3. INTELLIGENT SUBJECT IDENTIFICATION & REASONING:
    - For each question and in pageMeta, determine the precise academic subject (e.g., "Physics", "Chemistry", "Biology", "Mathematics", "English Language", "Literature in English", "Economics", "Government", "Geography", "Agricultural Science", "Accounting", "Commerce", "Civic Education", "Computer Studies", "History", etc.).
    - Reason conceptually: Understand the physical laws, chemical mechanisms, biological structures, or mathematical operations present, even if no subject heading appears on the page.
+   - ALWAYS populate the top-level "reasoning" field with your thought process before generating the rest of the JSON. Explain your classification and deductions there.
 
 4. NOISE REJECTION & PHOTO ARTIFACTS:
    - Human-captured photos often capture parts of an adjacent page in the margin, book spine shadows, fingers, or background desk text.
@@ -98,13 +101,19 @@ CRITICAL EXTRACTION & FORMATTING RULES:
    - If a question starts mid-sentence or mid-options from a previous page, set "isContinuation": true.
    - If a question is cut off at the bottom of the page, set "incomplete": true and populate "openQuestionCarry".
 
-7. INHERITANCE:
-   - Inherit activeYear, activePaper, and activeSubject from SESSION MEMORY when no new header is present.`;
+7. YEAR / PAPER / SUBJECT DETECTION — PAGE TEXT IS GROUND TRUTH (CRITICAL):
+   - ALWAYS scan the OCR text for year headers, exam titles, or section headings FIRST.
+   - Examples of headers you MUST detect: "2011 POST UTME TEST", "OBAFEMI AWOLOWO UNIVERSITY 2009", "POST-UTME SCREENING 2012", or any line containing a 4-digit year (2000-2030) alongside an exam name.
+   - If ANY such header or year is visible in the OCR text, you MUST set pageMeta.year and pageMeta.paper from the PAGE TEXT — NOT from session memory.
+   - Session memory (activeYear, activePaper, activeSubject) is ONLY a fallback for pages that have NO visible header at all — e.g. a continuation page with just question options and no title.
+   - NEVER discard a visible year header because it "conflicts" with session memory. The printed text on the page is always ground truth. Session memory is stale context from a previous page.
+   - ANTI-PATTERN (DO NOT DO THIS): Seeing "2011 POST UTME TEST" in the OCR but outputting year:"2008" because session memory says activeYear:"2008". This is WRONG — always output year:"2011".`;
 
 const ANSWER_KEY_PROMPT = `You extract marking schemes and answer keys from past-question answer sections.
 
 Return JSON ONLY:
 {
+  "reasoning": "Step-by-step reasoning explaining how you identified the answers, handled any ambiguous formats, or matched year/paper headers.",
   "year": string|null,
   "paper": string|null,
   "subject": string|null,
@@ -130,10 +139,11 @@ Guidelines:
 
 function buildMemoryBlock(memory) {
   const m = memory || {};
-  return `SESSION CONTEXT & MEMORY:
+  return `SESSION CONTEXT & MEMORY (FALLBACK ONLY — see rule 7):
+- IMPORTANT: If the OCR text contains ANY year header or exam title (e.g. "2011 POST UTME"), you MUST use that year/paper and IGNORE activeYear/activePaper below. Session memory is stale context from a previous page.
 - activeSubject: ${m.activeSubject ? `"${m.activeSubject}"` : 'null (deduce from content)'}
-- activeYear: ${m.activeYear ? `"${m.activeYear}"` : 'null'}
-- activePaper: ${m.activePaper ? `"${m.activePaper}"` : 'null'}
+- activeYear: ${m.activeYear ? `"${m.activeYear}"` : 'null'} (use ONLY if this page has no visible year/header)
+- activePaper: ${m.activePaper ? `"${m.activePaper}"` : 'null'} (use ONLY if this page has no visible paper/header)
 - answersSectionStarted: ${Boolean(m.answersSectionStarted)}
 - recentQuestionNumbers: ${JSON.stringify((m.recentQuestionNumbers || []).slice(-20))}
 - countsByGroup: ${JSON.stringify(m.countsByGroup || {})}

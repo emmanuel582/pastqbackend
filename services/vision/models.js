@@ -104,11 +104,16 @@ const IMAGE_PREP = {
   jpegQuality: Number(process.env.VISION_JPEG_QUALITY || 90),
 };
 
-const CONCURRENCY = Number(process.env.VISION_CONCURRENCY || 2);
+/** Default 1: sequential extract avoids year/openQuestion races on multi-year PDFs. */
+const CONCURRENCY = Number(process.env.VISION_CONCURRENCY || 1);
 const CIRCUIT_BREAKER_THRESHOLD = Number(process.env.VISION_CIRCUIT_BREAKER || 5);
 
+/** Used when hybrid strong (OpenRouter) is unavailable — never demote to Small. */
+const STRONG_FALLBACK_MODEL =
+  process.env.VISION_STRONG_FALLBACK_MODEL || 'mistral-medium-latest';
+
 function pricingForModel(model) {
-  if (model === MODELS.strong) return PRICING.strong;
+  if (model === MODELS.strong || model === STRONG_FALLBACK_MODEL) return PRICING.strong;
   return PRICING.cheap;
 }
 
@@ -159,6 +164,7 @@ export {
   IMAGE_PREP,
   CONCURRENCY,
   CIRCUIT_BREAKER_THRESHOLD,
+  STRONG_FALLBACK_MODEL,
   pricingForModel,
   providerForStage,
   needsStrongExtract,

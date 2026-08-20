@@ -246,7 +246,7 @@ router.post('/sessions/:id/resume', (req, res) => {
 
     let requeued = 0;
     for (const page of session.pages) {
-      if (page.status === 'failed' || page.status === 'needs_input') {
+      if (page.status === 'failed' || page.status === 'needs_input' || page.status === 'processing') {
         page.status = 'pending';
         page.error = null;
         page.retryCount = Math.min(page.retryCount || 0, MAX_RETRIES - 1);

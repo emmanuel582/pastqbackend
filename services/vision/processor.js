@@ -680,7 +680,8 @@ async function extractAnswerKey(ocrMarkdown, memory) {
   return { data, usage, model };
 }
 
-async function processOnePage(session, page) {
+async function processOnePage(session, pageObj) {
+  const page = session.pages.find((p) => p.id === pageObj.id) || session.pages[pageObj.index] || pageObj;
   page.status = 'processing';
   page.retryCount = page.retryCount || 0;
   page.modelPath = page.modelPath || 'cheap';
@@ -691,7 +692,7 @@ async function processOnePage(session, page) {
   // Step 1: High-fidelity OCR via dedicated engine
   if (!ocrMarkdown) {
     const ocrProv = IS_HYBRID ? 'mistral' : PROVIDER;
-    console.log(`[vision] page ${page.index + 1} OCR via ${ocrProv} ${MODELS.ocr}`);
+    console.log(`[vision:ocr] Page ${page.index + 1}/${session.pages.length}: Running OCR via ${ocrProv} ${MODELS.ocr}...`);
     if (!page.dataUrl && !page.imagePath) {
       throw new Error('Page has no image or OCR text');
     }
@@ -714,11 +715,13 @@ async function processOnePage(session, page) {
     addCost(session, { ocrPages });
     page.ocrMarkdown = ocrMarkdown;
     delete page.dataUrl;
+    console.log(`[vision:ocr] Page ${page.index + 1}: OCR extracted ${ocrMarkdown.length} characters.`);
   }
 
   if (!ocrMarkdown || ocrMarkdown.length < 8) {
     page.status = 'skipped';
     page.pageType = 'blank';
+    console.log(`[vision:skip] Page ${page.index + 1} is empty/blank (<8 chars), skipping.`);
     return;
   }
 
@@ -728,6 +731,7 @@ async function processOnePage(session, page) {
     page.classifyConfidence = heuristic.confidence;
     page.status = 'skipped';
     page.skipReason = heuristic.reason;
+    console.log(`[vision:heuristic] Page ${page.index + 1} skipped: ${heuristic.reason}`);
     return;
   }
 
@@ -735,6 +739,7 @@ async function processOnePage(session, page) {
   const effectiveSubjectHint =
     session.memory.activeSubject || session.subjectHint || null;
 
+  console.log(`[vision:extract] Page ${page.index + 1}: Extracting questions with Mistral Small (subjectHint=${effectiveSubjectHint || 'auto'})...`);
   let { data: extracted, usage: eUsage, model: eModel } = await extractQuestions(
     ocrMarkdown,
     session.memory,
@@ -747,6 +752,10 @@ async function processOnePage(session, page) {
   const pageType = pageMeta.pageType || (extracted?.questions?.length > 0 ? 'question_content' : 'blank');
   page.pageType = pageType;
   page.classifyConfidence = pageMeta.confidence ?? 0.9;
+
+  console.log(
+    `[vision:classify] Page ${page.index + 1}: type="${pageType}", confidence=${page.classifyConfidence}, year=${pageMeta.year || '?'}, paper=${pageMeta.paper || '?'}, subject=${pageMeta.subject || '?'}`
+  );
 
   if (pageMeta.year) {
     session.memory.activeYear = String(pageMeta.year);
@@ -772,6 +781,7 @@ async function processOnePage(session, page) {
 
   if (pageType === 'blank' || pageType === 'cover_toc') {
     page.status = 'skipped';
+    console.log(`[vision:skip] Page ${page.index + 1} marked as ${pageType}, skipped.`);
     return;
   }
 
@@ -786,11 +796,13 @@ async function processOnePage(session, page) {
     };
     mergeFollowUps(session, [fu]);
     page.followUpId = fu.id;
+    console.warn(`[vision:unclear] Page ${page.index + 1} marked as needs_input (unclear).`);
     return;
   }
 
   if (pageType === 'answer_key') {
     session.memory.answersSectionStarted = true;
+    console.log(`[vision:answers] Page ${page.index + 1}: Parsing answer keys...`);
     const { data: answers, usage: aUsage, model: aModel } = await extractAnswerKey(
       ocrMarkdown,
       session.memory
@@ -814,13 +826,14 @@ async function processOnePage(session, page) {
     );
     applyAnswerKeys(session);
     page.status = 'done';
+    console.log(`[vision:answers] Page ${page.index + 1}: Saved ${answers.answers?.length || 0} answer keys.`);
     return;
   }
 
   // Step 3: Selective Escalation to Strong Reasoning Model if required
   const gate = needsStrongExtract(ocrMarkdown, pageMeta, extracted);
   if (gate.yes) {
-    console.log(`[escalate] page ${page.index + 1}: ${gate.reason}`);
+    console.log(`[escalate] Page ${page.index + 1}: Escalating due to "${gate.reason}"`);
     ensureCost(session).escalations += 1;
     page.modelPath = 'strong';
     page.escalateReason = gate.reason;
@@ -854,6 +867,9 @@ async function processOnePage(session, page) {
   deduplicateQuestions(session);
   rebuildGroups(session);
   page.status = 'done';
+  console.log(
+    `[vision:done] Page ${page.index + 1} DONE: ${extracted.questions?.length || 0} question(s) parsed. Session total: ${session.questions.length} questions across ${session.groups.length} group(s).`
+  );
 }
 
 function trimMemory(session) {
@@ -968,28 +984,32 @@ async function runSessionWorker(sessionId) {
             console.warn('[supabase-sync] progressive sync error:', err.message)
           );
         } catch (err) {
-          console.error(`Page ${page.index} error:`, err);
+          console.error(`[vision:error] Page ${page.index + 1} error:`, err?.message || err);
           const s = getSession(sessionId);
           if (!s) return;
 
-          page.retryCount = (page.retryCount || 0) + 1;
-          page.error = err.message || String(err);
+          const targetPage = s.pages.find((p) => p.id === page.id) || s.pages[page.index] || page;
+          targetPage.retryCount = (targetPage.retryCount || 0) + 1;
+          targetPage.error = err?.message || String(err);
 
-          if (page.retryCount <= MAX_RETRIES) {
-            page.status = 'pending';
-            await sleep(Math.min(30000, 1000 * Math.pow(2, page.retryCount)));
+          if (targetPage.retryCount <= MAX_RETRIES) {
+            targetPage.status = 'pending';
+            const delay = Math.min(30000, 1000 * Math.pow(2, targetPage.retryCount));
+            console.warn(`[vision:retry] Page ${page.index + 1} failed. Retrying in ${delay}ms (attempt ${targetPage.retryCount}/${MAX_RETRIES})...`);
+            await sleep(delay);
           } else {
-            page.status = 'failed';
+            targetPage.status = 'failed';
             consecutiveFailures++;
+            console.error(`[vision:failed] Page ${page.index + 1} failed permanently after ${MAX_RETRIES} attempts.`);
             if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
               circuitBroken = true;
             }
             mergeFollowUps(s, [
               {
-                id: `fail-${page.id}`,
+                id: `fail-${targetPage.id}`,
                 type: 'page_failed',
-                message: `Page ${page.index + 1} failed after retries: ${page.error}. You can resume to retry or replace this page.`,
-                pageId: page.id,
+                message: `Page ${page.index + 1} failed after retries: ${targetPage.error}. You can resume to retry or replace this page.`,
+                pageId: targetPage.id,
               },
             ]);
           }

@@ -28,6 +28,7 @@ import {
   isExplanationLikeQuestion,
 } from './models.js';
 import { normalizeQuestionMath } from './mathNormalize.js';
+import { auditExtractedQuestions } from './coherence.js';
 
 function resolvePageDataUrl(dataUrl, imagePath) {
   if (dataUrl && String(dataUrl).startsWith('data:')) return dataUrl;
@@ -969,7 +970,7 @@ function stitchContinuation(session, pageIndex, extracted) {
 async function extractQuestions(ocrMarkdown, memory, subjectHint, model = MODELS.cheap) {
   const { data, usage, model: used } = await chatJson(
     EXTRACT_PROMPT,
-    `${buildMemoryBlock(memory)}\nContext subject: ${subjectHint || 'Deduce from content'}\n\nFormat all mathematical, physical, and chemical formulas in standard LaTeX ($...$). Discard background noise from adjacent pages.\n\n--- OCR TRANSCRIPTION ---\n${ocrMarkdown.slice(0, 14000)}\n--- END ---`,
+    `${buildMemoryBlock(memory)}\nContext subject: ${subjectHint || 'Deduce from content'}\n\nFormat all mathematical, physical, and chemical formulas in standard LaTeX ($...$). Discard background noise from adjacent pages.\nCRITICAL: Discard any leading/trailing crop fragments that have no visible question number. Never attach orphan option text to a different question number.\n\n--- OCR TRANSCRIPTION ---\n${ocrMarkdown.slice(0, 14000)}\n--- END ---`,
     { maxTokens: 8192, model, label: 'extract' }
   );
   return { data, usage, model: used };
@@ -1135,6 +1136,13 @@ async function executePageExtraction(
     }
     if (extracted?.pageMeta) extracted.pageMeta.pageType = pageType;
 
+    // Structural coherence: drop orphan crop fragments, flag option-count outliers
+    let coherence = { shouldEscalate: false, flags: [], missing: [] };
+    if (pageType === 'question_content' && extracted?.questions?.length) {
+      coherence = auditExtractedQuestions(extracted, { pageNum });
+      extracted.questions = coherence.questions;
+    }
+
     console.log(
       `[vision:classify] Page ${pageNum}: type="${pageType}", confidence=${classifyConfidence}, year=${pageMeta.year || '?'}, paper=${pageMeta.paper || '?'}, subject=${pageMeta.subject || '?'}`
     );
@@ -1253,10 +1261,13 @@ async function executePageExtraction(
     let modelPath = 'cheap';
     let escalateReason = null;
     const gate = needsStrongExtract(md, { ...pageMeta, pageType }, extracted);
-    if (gate.yes) {
-      console.log(`[escalate] Page ${pageNum}: Escalating due to "${gate.reason}"`);
+    const wantStrong = gate.yes || coherence.shouldEscalate;
+    if (wantStrong) {
+      escalateReason = gate.yes
+        ? gate.reason
+        : `coherence:${(coherence.flags || []).map((f) => f.action).join('+') || 'fail'}`;
+      console.log(`[escalate] Page ${pageNum}: Escalating due to "${escalateReason}"`);
       modelPath = 'strong';
-      escalateReason = gate.reason;
       const strong = await extractQuestions(md, memory, effectiveSubjectHint, MODELS.strong);
       trackCost({ usage: strong.usage, model: strong.model });
       extracted = strong.data;
@@ -1277,6 +1288,8 @@ async function executePageExtraction(
         extracted.questions = extracted.questions
           .filter((q) => !isExplanationLikeQuestion(q))
           .map(normalizeQuestionMath);
+        coherence = auditExtractedQuestions(extracted, { pageNum });
+        extracted.questions = coherence.questions;
       }
       if (pageType === 'explanation' || pageType === 'blank' || pageType === 'cover_toc') {
         console.log(`[vision:skip] Page ${pageNum} reclassified after escalate as ${pageType}`);
@@ -1295,12 +1308,21 @@ async function executePageExtraction(
       }
     }
 
+    const followUps = [...(extracted?.followUps || [])];
+    if (coherence.missing?.length) {
+      followUps.push({
+        type: 'missing_question_numbers',
+        message: `Page ${pageNum}: question number(s) ${coherence.missing.join(', ')} missing or dropped after coherence checks. Re-snap that region if needed.`,
+        meta: { pageIndex, missing: coherence.missing },
+      });
+    }
+
     return {
       pageType,
       classifyConfidence,
       extracted,
       memoryUpdates,
-      followUps: extracted?.followUps || [],
+      followUps,
       questionCount: extracted?.questions?.length || 0,
       escalateReason,
       modelPath,

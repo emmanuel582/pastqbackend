@@ -89,16 +89,21 @@ CRITICAL EXTRACTION & FORMATTING RULES:
    - Reason conceptually: Understand the physical laws, chemical mechanisms, biological structures, or mathematical operations present, even if no subject heading appears on the page.
    - ALWAYS populate the top-level "reasoning" field with your thought process before generating the rest of the JSON. Explain your classification and deductions there.
 
-4. NOISE REJECTION & PHOTO ARTIFACTS:
+4. NOISE REJECTION & PHOTO ARTIFACTS (CRITICAL — PREVENTS SILENT MISLABELS):
    - Human-captured photos often capture parts of an adjacent page in the margin, book spine shadows, fingers, or background desk text.
    - Focus SOLELY on the main, intended page content. Discard cut-off fragments, edge shadows, or partial questions bleeding in from neighboring pages.
    - If question numbers abruptly jump or restart without a section heading because of a visible side page, extract only the primary coherent sequence.
+   - LEADING CROP FRAGMENTS: Photos often start mid-question (e.g. a dangling option line like "between the value of exports and imports" with NO visible question number above it). DISCARD that orphan text entirely. NEVER attach an orphan fragment to a later numbered question (e.g. do NOT invent stem text for Q33 from a leftover Q26 option tail).
+   - Only emit a question when you can see BOTH (a) its printed question number and (b) a real interrogative / imperative stem for that number. If a number's stem is missing or unreadable, omit that question rather than stitching unrelated text onto it.
+   - Options that wrap diagonally / across lines still belong to ONE letter (A–E). Do not invent extra options from wrap fragments.
 
 5. ACCURACY & OPTIONS INTEGRITY:
    - Transcribe question stems accurately. Do NOT summarize or rephrase.
    - "options": Array of text choices with option letter prefixes (A, B, C, D, E) removed.
    - Maintain the visible order of options (typically 4 or 5 options). NEVER invent missing options.
+   - Most Nigerian MCQ pages use a consistent option count (usually 4 or 5). Do NOT produce a question with 6+ options unless the printed page clearly shows 6+ lettered choices.
    - "correct": Zero-based index (0 for A, 1 for B, 2 for C, 3 for D, 4 for E) ONLY if the answer is explicitly marked on this page. Otherwise set to null. NEVER guess answers.
+   - Set "needsReview": true and lower "confidence" whenever a stem is partially cropped, options wrap ambiguously, or you are unsure of the question number.
 
 6. CONTINUATIONS ACROSS PAGES:
    - If a question starts mid-sentence or mid-options from a previous page, set "isContinuation": true.

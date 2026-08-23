@@ -9,6 +9,7 @@ import {
 } from './prompts.js';
 import { getSession, saveSession, updateProgress, getJobs, saveJobs } from './store.js';
 import { syncSessionToSupabase } from './supabaseSync.js';
+import { syncSessionToLibrary } from '../library/librarySync.js';
 import {
   PROVIDER,
   IS_GROQ,
@@ -1726,12 +1727,17 @@ async function runSessionWorker(sessionId) {
             rebuildGroups(s);
           });
 
-          // Progressive Supabase sync (fire and forget, outside lock)
+          // Progressive library sync (primary) + optional Supabase
           const latestSession = getSession(sessionId);
           if (latestSession) {
-            syncSessionToSupabase(latestSession).catch((err) =>
-              console.warn('[supabase-sync] progressive sync error:', err.message)
+            syncSessionToLibrary(latestSession).catch((err) =>
+              console.warn('[library-sync] progressive sync error:', err.message)
             );
+            if (process.env.LIBRARY_SYNC_SUPABASE === 'true') {
+              syncSessionToSupabase(latestSession).catch((err) =>
+                console.warn('[supabase-sync] progressive sync error:', err.message)
+              );
+            }
           }
 
           console.log(
@@ -1821,10 +1827,15 @@ async function runSessionWorker(sessionId) {
     saveJobs(jobs);
     saveSession(session);
 
-    // Final comprehensive Supabase sync
-    syncSessionToSupabase(session).catch((err) =>
-      console.warn('[supabase-sync] final sync error:', err.message)
+    // Final library sync (primary VPS store)
+    syncSessionToLibrary(session).catch((err) =>
+      console.warn('[library-sync] final sync error:', err.message)
     );
+    if (process.env.LIBRARY_SYNC_SUPABASE === 'true') {
+      syncSessionToSupabase(session).catch((err) =>
+        console.warn('[supabase-sync] final sync error:', err.message)
+      );
+    }
   } finally {
     activeWorkers.delete(sessionId);
   }

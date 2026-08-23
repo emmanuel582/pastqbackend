@@ -3,9 +3,11 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import authRoutes from './routes/auth.js';
 import visionRoutes from './routes/vision.js';
+import libraryRoutes from './routes/library.js';
 import { PROVIDER, MODELS } from './services/vision/models.js';
 import { listSessions } from './services/vision/store.js';
 import { syncAllPendingSessions } from './services/vision/supabaseSync.js';
+import { syncAllSessionsToLibrary } from './services/library/librarySync.js';
 import { openRouterKeyFingerprint } from './services/vision/openrouterProvider.js';
 
 dotenv.config();
@@ -69,6 +71,7 @@ app.use('/api/vision', (req, _res, next) => {
   next();
 });
 app.use('/api/vision', visionRoutes);
+app.use('/api/library', libraryRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });
@@ -84,8 +87,15 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`[vision] provider=${PROVIDER} ocr=${MODELS.ocr} cheap=${MODELS.cheap} strong=${MODELS.strong}`);
   console.log(`[vision] OPENROUTER_API_KEY=${openRouterKeyFingerprint()}`);
 
-  // Sync completed sessions to Supabase on startup so all users can see them
-  syncAllPendingSessions(listSessions).catch((err) => {
-    console.warn('[supabase-sync] startup sync error:', err.message);
+  // Sync completed sessions to VPS library on startup
+  syncAllSessionsToLibrary(listSessions).catch((err) => {
+    console.warn('[library-sync] startup sync error:', err.message);
   });
+
+  // Optional legacy Supabase sync
+  if (process.env.LIBRARY_SYNC_SUPABASE === 'true') {
+    syncAllPendingSessions(listSessions).catch((err) => {
+      console.warn('[supabase-sync] startup sync error:', err.message);
+    });
+  }
 });

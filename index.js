@@ -1,6 +1,6 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import authRoutes from './routes/auth.js';
 import visionRoutes from './routes/vision.js';
 import libraryRoutes from './routes/library.js';
@@ -9,8 +9,10 @@ import { listSessions } from './services/vision/store.js';
 import { syncAllPendingSessions } from './services/vision/supabaseSync.js';
 import { syncAllSessionsToLibrary } from './services/library/librarySync.js';
 import { openRouterKeyFingerprint } from './services/vision/openrouterProvider.js';
+import { installLibrarySeeds } from './services/library/seeds.js';
 
-dotenv.config();
+const shippedBundle = installLibrarySeeds();
+console.log(`[library] ${shippedBundle.title}: ${shippedBundle.questions.length} questions available`);
 
 const app = express();
 const PORT = process.env.PORT || 3000;

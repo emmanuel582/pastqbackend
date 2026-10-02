@@ -9,7 +9,8 @@ import { nanoid } from 'nanoid';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function libraryDir() {
-  return process.env.PASTQ_LIBRARY_DIR || path.join(__dirname, '../../data/library');
+  const dataRoot = process.env.DATA_DIR || process.env.PASTQ_DATA_DIR || path.join(__dirname, '../../data');
+  return path.resolve(process.env.PASTQ_LIBRARY_DIR || path.join(dataRoot, 'library'));
 }
 
 function bundlesDir() {
@@ -69,6 +70,7 @@ export function getBundle(id) {
 }
 
 export function saveBundle(bundle) {
+  ensureDirs();
   bundle.updated_at = new Date().toISOString();
   if (!bundle.created_at) bundle.created_at = bundle.updated_at;
   fs.writeFileSync(bundlePath(bundle.id), JSON.stringify(bundle, null, 2));
@@ -121,7 +123,7 @@ function deriveStats(questions) {
   const subjects = [...new Set((questions || []).map((q) => q.subject).filter(Boolean))].sort();
   const years = (questions || [])
     .map((q) => parseInt(String(q.year || ''), 10))
-    .filter((y) => !Number.isNaN(y) && y > 1980 && y < 2100);
+    .filter((y) => !Number.isNaN(y) && y > 1900 && y < 2100);
   return {
     subjects,
     yearMin: years.length ? Math.min(...years) : null,
@@ -245,6 +247,23 @@ export function upsertSessionToLibrary(session, libraryMeta) {
 
 export function getCatalog() {
   return readCatalog();
+}
+
+/** Install shipped content once; restarting never replaces reviewed questions. */
+export function installSeedBundle(seed) {
+  const catalog = readCatalog();
+  const entry = findManufacturerEntry(catalog, seed.libraryMeta);
+  const bundle = getBundle(seed.id) || (entry && getBundle(entry.mfg.bundleId))
+    || listBundles().find((item) => (item.sourceSessionIds || []).includes(seed.documentSource?.extractionSession))
+    || saveBundle(structuredClone(seed));
+
+  const before = JSON.stringify(catalog);
+  const material = upsertCatalogEntry(catalog, bundle.libraryMeta || seed.libraryMeta,
+    bundle.id, deriveStats(bundle.questions));
+  material.title = bundle.title || bundle.name;
+  material.streams = bundle.libraryMeta?.streams || seed.libraryMeta.streams || [];
+  if (JSON.stringify(catalog) !== before) writeCatalog(catalog);
+  return bundle;
 }
 
 export function searchBundles({ query, university, examType, manufacturer } = {}) {

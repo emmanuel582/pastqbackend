@@ -9,8 +9,16 @@ import {
 import { getSession } from '../services/vision/store.js';
 import { classifyLibrarySession } from '../services/vision/libraryClassifier.js';
 import { saveSession } from '../services/vision/store.js';
+import { libraryFigurePath } from '../services/library/figures.js';
 
 const router = Router();
+
+router.get('/figures/:sessionId/:file', (req, res) => {
+  const file = libraryFigurePath(req.params.sessionId, req.params.file);
+  if (!file) return res.status(404).json({ error: 'Figure not found' });
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  res.type('jpg').sendFile(file);
+});
 
 router.get('/catalog', (_req, res) => {
   try {

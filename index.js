@@ -7,6 +7,8 @@ import { resumeInterruptedSessions } from './services/vision/processor.js';
 import libraryRoutes from './routes/library.js';
 import { installLibrarySeeds } from './services/library/seeds.js';
 import recommendationRoutes from './routes/recommendations.js';
+import reminderRoutes from './routes/reminders.js';
+import { startReminderScheduler } from './services/reminders/delivery.js';
 import fs from 'fs';
 import { getDataRoot } from './services/vision/store.js';
 import { requestContext, securityHeaders } from './services/http/security.js';
@@ -15,6 +17,7 @@ import { createOriginMatcher } from './services/http/origins.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const listenAddress = process.env.PASTQ_BIND_ADDRESS || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1');
 
 app.set('trust proxy', 1);
 app.use(requestContext);
@@ -47,7 +50,7 @@ app.use(cors({
 }));
 
 app.use((req, res, next) => {
-  const limit = req.path.startsWith('/api/auth/') ? '16kb' : '20mb';
+  const limit = req.path.startsWith('/api/auth/') ? '16kb' : req.path.startsWith('/api/reminders') ? '64kb' : '20mb';
   express.json({ limit })(req, res, next);
 });
 
@@ -77,6 +80,7 @@ app.use('/api/vision', (req, _res, next) => {
 app.use('/api/vision', visionRoutes);
 app.use('/api/library', libraryRoutes);
 app.use('/api/recommendations', recommendationRoutes);
+app.use('/api/reminders', reminderRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });
@@ -117,10 +121,11 @@ app.use((err, _req, res, _next) => {
 
 installLibrarySeeds();
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`PastQ backend listening on 0.0.0.0:${PORT}`);
+app.listen(PORT, listenAddress, () => {
+  console.log(`PastQ backend listening on ${listenAddress}:${PORT}`);
   // Continue any extraction that was interrupted by a restart or crash.
   resumeInterruptedSessions();
+  startReminderScheduler();
   console.log(`[vision] model=${process.env.VISION_MODEL || 'meta/muse-spark-1.3-contributor'} (capabilities checked per session)`);
   console.log(`[vision] OPENROUTER_API_KEY=${openRouterKeyFingerprint()}`);
 

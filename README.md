@@ -93,3 +93,7 @@ npm start
 
 Only local development may use `AUTH_DISABLED_FOR_LOCAL_DEVELOPMENT=true`; this
 switch is explicitly rejected when `NODE_ENV=production`.
+
+## Study reminders
+
+The authenticated reminder API and background scheduler use the existing persistent data directory. Deploy this backend before the matching frontend; see [reminder setup and device checks](docs/study-reminders.md) for stable keys, opt-in delivery and iPhone Home Screen requirements.

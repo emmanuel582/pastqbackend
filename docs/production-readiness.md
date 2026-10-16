@@ -4,7 +4,7 @@ Account creation uses name, email and password (or Google). After authentication
 students choose **Undergraduate** or **Other learner**. Undergraduates choose a
 university. Other learners choose a school, an exam, or Explore. Preferences live
 in authenticated Supabase account metadata; they are personalization, never an
-authorization role. Accounts with a saved study choice skip completed onboarding. Legacy profile completion flags do not bypass the new study choice. The home screen can reopen personalization even after Explore.
+authorization role. Accounts with a saved study choice skip completed onboarding. Legacy profile completion flags do not bypass the new study choice. Choices are saved for future personalization. Home does not display the selected school/exam or ask students to change it, and Browse opens without filtering by that choice.
 
 Uploads finish extraction, receive a single review, then **Looks good — save**
 confirms the complete material before opening session setup. The confirmation is
@@ -78,3 +78,13 @@ proven by local tests:
 
 Enterprise SSO/SCIM, payments, healthcare compliance and audit certifications are
 not required by this student practice flow and are not claimed by these changes.
+
+## App welcome
+
+The initial view is a full-height app welcome with Scholar and Create account / Sign in actions, without a speech bubble. The welcome hand waves continuously and the eyes blink using the original closed-eye artwork, while the face and body stay anchored. Reduced-motion mode keeps both still. Create account uses the 67 pose with its raised hand away from a short frosted-glass greeting and three oval dots toward his mouth. Speech uses Outfit at a lighter weight. Missing blink artwork leaves the original open eyes; character artwork never blocks account actions. Marketing kickers, slogan headings, decorative category numbering and repeated descriptions have been removed from the study screens.
+
+The supplied atlas and bonus sheets were reviewed. Beyond the welcome and signup greeting, screens use still poses: neutral for sign-in, reassuring hand-to-chest for onboarding, reading for study/upload processing, thinking for exam customization, patient hands for waiting, and the relaxed smile for completed sessions. Running, jumping and alarm poses are reserved rather than placed beside forms or timed exam questions.
+
+## Preferences and study reminders
+
+Preferences now shows real session statistics and a score graph, with separate Theme and Study reminders pages. Placeholder controls, preparing-for fields and sign-out links have been removed. Study reminders use authenticated, persistent account settings and encrypted server-side Web Push, not temporary client timers. Delivery is opt-in, respects selected days, quiet hours and pauses, skips saved practice days, and supports an owned-device test. See [runtime, persistence, delivery and real-device release checks](study-reminders.md).

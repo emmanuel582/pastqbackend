@@ -8,6 +8,7 @@ import libraryRoutes from './routes/library.js';
 import { installLibrarySeeds } from './services/library/seeds.js';
 import recommendationRoutes from './routes/recommendations.js';
 import reminderRoutes from './routes/reminders.js';
+import discoverRoutes from './routes/discover.js';
 import { startReminderScheduler } from './services/reminders/delivery.js';
 import fs from 'fs';
 import { getDataRoot } from './services/vision/store.js';
@@ -50,7 +51,7 @@ app.use(cors({
 }));
 
 app.use((req, res, next) => {
-  const limit = req.path.startsWith('/api/auth/') ? '16kb' : req.path.startsWith('/api/reminders') ? '64kb' : '20mb';
+  const limit = req.path.startsWith('/api/auth/') || req.path.startsWith('/api/discover') ? '16kb' : req.path.startsWith('/api/reminders') ? '64kb' : '20mb';
   express.json({ limit })(req, res, next);
 });
 
@@ -81,6 +82,7 @@ app.use('/api/vision', visionRoutes);
 app.use('/api/library', libraryRoutes);
 app.use('/api/recommendations', recommendationRoutes);
 app.use('/api/reminders', reminderRoutes);
+app.use('/api/discover', discoverRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });

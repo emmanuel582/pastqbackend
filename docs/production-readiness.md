@@ -4,7 +4,7 @@ Account creation uses name, email and password (or Google). After authentication
 students choose **Undergraduate** or **Other learner**. Undergraduates choose a
 university. Other learners choose a school, an exam, or Explore. Preferences live
 in authenticated Supabase account metadata; they are personalization, never an
-authorization role. Returning accounts skip completed onboarding.
+authorization role. Accounts with a saved study choice skip completed onboarding. Legacy profile completion flags do not bypass the new study choice. The home screen can reopen personalization even after Explore.
 
 Uploads finish extraction, receive a single review, then **Looks good — save**
 confirms the complete material before opening session setup. The confirmation is
@@ -52,7 +52,7 @@ storage, onboarding branches and recovery errors. Browser checks exercise accoun
 creation and upload → review → failed-save retry → setup → exam → corrections →
 Browse → saved setup. Phone checks use responsive Chromium viewports, including
 375px/390px; they do not certify native Android/iOS or Safari behavior. Scholar
-respects reduced motion, and exam timing already follows wall-clock deadlines
+uses still poses on permanent screens, a subtle loading breath and a single smiling result pose. It respects reduced motion, and exam timing already follows wall-clock deadlines
 when a phone suspends the tab.
 
 ## Live release checks

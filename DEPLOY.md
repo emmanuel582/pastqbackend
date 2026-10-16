@@ -23,7 +23,7 @@ Do not deploy `render.yaml` for the Hostinger production environment.
 Update the server from a clean checkout (run from the repo root):
 
 ```bash
-git -c core.autocrlf=false archive --format=tar HEAD:server | \
+git -c core.autocrlf=false archive --format=tar HEAD | \
   ssh root@VPS 'mkdir -p /opt/pastq.new && tar -x -C /opt/pastq.new && \
     cp /opt/pastq/.env.production /opt/pastq.new/ && rm -rf /opt/pastq && mv /opt/pastq.new /opt/pastq && \
     cd /opt/pastq && docker compose -f docker-compose.hostinger.yml up -d --build'

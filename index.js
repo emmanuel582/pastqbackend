@@ -3,38 +3,38 @@ import express from 'express';
 import cors from 'cors';
 import authRoutes from './routes/auth.js';
 import visionRoutes from './routes/vision.js';
+import { resumeInterruptedSessions } from './services/vision/processor.js';
 import libraryRoutes from './routes/library.js';
-import { PROVIDER, MODELS } from './services/vision/models.js';
-import { listSessions } from './services/vision/store.js';
-import { syncAllPendingSessions } from './services/vision/supabaseSync.js';
-import { syncAllSessionsToLibrary } from './services/library/librarySync.js';
-import { openRouterKeyFingerprint } from './services/vision/openrouterProvider.js';
 import { installLibrarySeeds } from './services/library/seeds.js';
-
-const shippedBundle = installLibrarySeeds();
-console.log(`[library] ${shippedBundle.title}: ${shippedBundle.questions.length} questions available`);
+import recommendationRoutes from './routes/recommendations.js';
+import fs from 'fs';
+import { getDataRoot } from './services/vision/store.js';
+import { requestContext, securityHeaders } from './services/http/security.js';
+import { openRouterKeyFingerprint } from './services/vision/openrouterProvider.js';
+import { createOriginMatcher } from './services/http/origins.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.set('trust proxy', 1);
+app.use(requestContext);
+app.use(securityHeaders);
 
-const allowedOrigins = (process.env.FRONTEND_URL || '')
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
+const origins = createOriginMatcher(process.env.FRONTEND_URL);
 
 app.use(cors({
   origin(origin, callback) {
     // Allow non-browser tools and same-origin requests
     if (!origin) return callback(null, true);
-    if (allowedOrigins.length === 0) return callback(null, true);
-    if (allowedOrigins.includes('*')) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    // Vercel production + preview deployments
-    if (/\.vercel\.app$/i.test(origin)) return callback(null, true);
+    // A production browser origin must be intentionally configured. This keeps
+    // a new Hostinger deployment from becoming a public cross-origin API.
+    if (!origins.configured && process.env.NODE_ENV === 'production') {
+      console.warn('[cors] FRONTEND_URL is not configured; blocking browser origin');
+      return callback(null, false);
+    }
+    if (!origins.configured || (origins.allowsAny && process.env.NODE_ENV !== 'production') || origins.allows(origin)) return callback(null, true);
     // Local development
-    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
+    if (process.env.NODE_ENV !== 'production' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
       return callback(null, true);
     }
     // Reject without throwing — throwing strips CORS headers and looks like a browser CORS failure
@@ -46,13 +46,15 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+app.use((req, res, next) => {
+  const limit = req.path.startsWith('/api/auth/') ? '16kb' : '20mb';
+  express.json({ limit })(req, res, next);
+});
 
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
-    console.log(`[http] ${req.method} ${req.originalUrl} → ${res.statusCode} (${Date.now() - start}ms)`);
+    console.log(`[http] ${req.requestId} ${req.method} ${req.originalUrl} → ${res.statusCode} (${Date.now() - start}ms)`);
   });
   next();
 });
@@ -74,30 +76,55 @@ app.use('/api/vision', (req, _res, next) => {
 });
 app.use('/api/vision', visionRoutes);
 app.use('/api/library', libraryRoutes);
+app.use('/api/recommendations', recommendationRoutes);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });
 });
 
+if (process.env.NODE_ENV !== 'production') {
+  const { default: devMonitorRoutes } = await import('./routes/devMonitor.js');
+  app.use('/debug', devMonitorRoutes);
+  console.log('[dev] live monitor mounted at /debug/session/:id (local only, not mounted in production)');
+}
+
+app.get('/api/health/ready', (_req, res) => {
+  const authConfigured = (
+    Boolean(
+      (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL) &&
+      (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY)
+    ) && Boolean(process.env.SESSION_OWNER_HMAC_SECRET)
+  ) || (process.env.AUTH_DISABLED_FOR_LOCAL_DEVELOPMENT === 'true' && process.env.NODE_ENV !== 'production');
+  let storageWritable = true;
+  try {
+    fs.accessSync(getDataRoot(), fs.constants.R_OK | fs.constants.W_OK);
+  } catch {
+    storageWritable = false;
+  }
+  const ready = authConfigured && storageWritable;
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not_ready',
+    checks: { authentication: authConfigured, hostingerStorage: storageWritable },
+  });
+});
+
 app.use((err, _req, res, _next) => {
+  if (err.type === 'entity.too.large' || err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'This upload is too large. Choose a smaller file.' });
+  if (err instanceof SyntaxError && err.status === 400) return res.status(400).json({ error: 'Invalid request body.' });
   console.error('Unhandled error:', err.message || err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
+installLibrarySeeds();
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`PastQ backend listening on 0.0.0.0:${PORT}`);
-  console.log(`[vision] provider=${PROVIDER} ocr=${MODELS.ocr} cheap=${MODELS.cheap} strong=${MODELS.strong}`);
+  // Continue any extraction that was interrupted by a restart or crash.
+  resumeInterruptedSessions();
+  console.log(`[vision] model=${process.env.VISION_MODEL || 'meta/muse-spark-1.3-contributor'} (capabilities checked per session)`);
   console.log(`[vision] OPENROUTER_API_KEY=${openRouterKeyFingerprint()}`);
 
-  // Sync completed sessions to VPS library on startup
-  syncAllSessionsToLibrary(listSessions).catch((err) => {
-    console.warn('[library-sync] startup sync error:', err.message);
-  });
-
-  // Optional legacy Supabase sync
   if (process.env.LIBRARY_SYNC_SUPABASE === 'true') {
-    syncAllPendingSessions(listSessions).catch((err) => {
-      console.warn('[supabase-sync] startup sync error:', err.message);
-    });
+    console.warn('[storage] LIBRARY_SYNC_SUPABASE is ignored: question content is Hostinger-only.');
   }
 });

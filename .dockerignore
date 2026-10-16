@@ -1,0 +1,13 @@
+node_modules
+data
+.env
+.env.*
+!.env.example
+npm-debug.log*
+test_mistral.js
+test-photo.mjs
+tests
+scripts/check-db.js
+*.md
+Dockerfile
+docker-compose*.yml

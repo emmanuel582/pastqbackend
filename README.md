@@ -1,30 +1,89 @@
-# PastQ Backend (Render)
+> Standalone backend repository: commands run from this repository root.
+> Production requires a persistent writable data volume, verified Supabase configuration, an explicit FRONTEND_URL, and a stable SESSION_OWNER_HMAC_SECRET. Keep the ownership secret across redeploys. The retained Render free-plan example does not provide persistent storage; do not treat it as a durable production setup.
 
-## Deploy on Render
+# PastQ backend — Hostinger production deployment
 
-1. Go to [Render Dashboard](https://dashboard.render.com) → **New** → **Web Service**
-2. Connect repo: `https://github.com/emmanuel582/pastqbackend`
-3. Settings:
-   - **Runtime:** Node
-   - **Build Command:** `npm install`
-   - **Start Command:** `npm start`
-   - **Health Check Path:** `/api/health`
-4. Add environment variables:
+This service stores the question library, source images/PDFs, OCR artefacts, and
+extraction sessions on the Hostinger VPS. Supabase is used only for user
+authentication and student-owned progress data; it must never receive question
+content.
 
-| Key | Value |
-|-----|--------|
-| `NODE_VERSION` | `22` |
-| `MISTRAL_API_KEY` | your Mistral key |
-| `SUPABASE_URL` | `https://ovrlwgslzqvdofgkfcxl.supabase.co` |
-| `SUPABASE_ANON_KEY` | your Supabase anon key |
-| `SUPABASE_SERVICE_ROLE_KEY` | your Supabase service role key (recommended) |
-| `FRONTEND_URL` | your Vercel URL, e.g. `https://pastqfrontend.vercel.app` |
+## Deploy on a Hostinger VPS with Docker Compose
 
-5. Deploy → copy the Render URL (e.g. `https://pastq-backend.onrender.com`)
+1. Provision a VPS with Docker/Compose and point an API hostname such as
+   `api.example.com` to its public IP.
+2. Clone this repository on the VPS, then enter its `server` directory.
+3. Create the production secrets file without committing it:
 
-Or use Blueprint: this repo includes `render.yaml`.
+   ```bash
+   cp .env.example .env.production
+   chmod 600 .env.production
+   ```
 
-## Local
+4. Set these values in `.env.production`:
+
+   ```dotenv
+   NODE_ENV=production
+   FRONTEND_URL=https://app.example.com
+   DATA_DIR=/var/lib/pastq
+   SUPABASE_URL=https://your-project.supabase.co
+   SUPABASE_ANON_KEY=your-supabase-publishable-key
+   ADMIN_USER_IDS=comma-separated-supabase-user-ids
+   SESSION_OWNER_HMAC_SECRET=a-long-unique-random-secret
+   LIBRARY_SYNC_SUPABASE=false
+   ```
+
+   Add the selected vision-provider secret too. Do not set
+   `AUTH_DISABLED_FOR_LOCAL_DEVELOPMENT=true` on the VPS. Keep service-role keys
+   out of client environment variables; the current API does not require one.
+   `SESSION_OWNER_HMAC_SECRET` lets the VPS enforce extraction-session ownership
+   using a one-way HMAC instead of storing a Supabase user identifier locally.
+
+5. Start and check the service:
+
+   ```bash
+   docker compose -f docker-compose.hostinger.yml up -d --build
+   docker compose -f docker-compose.hostinger.yml ps
+   curl http://127.0.0.1:3000/api/health/ready
+   ```
+
+The named `pastq-hostinger-data` Docker volume is the durable Hostinger-side
+store. Back it up before deploys and before any manual library cleanup:
+
+```bash
+docker run --rm -v pastq-hostinger-data:/data -v "$PWD":/backup \
+  alpine tar czf /backup/pastq-data-$(date +%F).tgz -C /data .
+```
+
+## TLS reverse proxy
+
+Terminate TLS at Nginx (or your Hostinger control-panel proxy) and proxy only to
+the loopback port exposed by Compose:
+
+```nginx
+server {
+  server_name api.example.com;
+  client_max_body_size 50m;
+
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+  }
+}
+```
+
+Issue a certificate for that hostname, set the frontend’s `VITE_API_URL` to
+`https://api.example.com`, and put the exact frontend origin in `FRONTEND_URL`.
+The readiness route returns HTTP 503 until both writable VPS storage and
+Supabase token verification are configured.
+
+## Local development
 
 ```bash
 npm install
@@ -32,18 +91,5 @@ cp .env.example .env
 npm start
 ```
 
-`npm start` runs the vision API (`index.js`) used by the Vercel frontend (`/api/health`, `/api/vision/*`).
-
-For the alternate OpenRouter extraction server: `npm run start:extraction` (health at `/health`).
-
-## Shipped question library
-
-`npm start` installs **Chemistry Remix** from `seeds/chemistry-remix/` into the library before accepting requests: 1,899 extracted questions (1,894 have multiple-choice options), plus 121 referenced diagrams. It appears in the frontend's library and Science track as **Chemistry Remix**. No PDF upload, model call or Supabase import is needed.
-
-- Catalog: `GET /api/library/catalog`
-- Questions: `GET /api/library/bundles/A6uka2qCMT3HUY9EZutJc`
-- Diagrams: `GET /api/library/figures/chem-run3/<filename>`
-
-Set `DATA_DIR` (or `PASTQ_DATA_DIR`) to a persistent disk directory to retain local corrections. `PASTQ_LIBRARY_DIR` can override the bundle/catalog directory separately. Restarts restore missing shipped files and catalog entries without overwriting existing questions or diagrams. Source review flags and missing answer keys are retained.
-
-The deployed frontend's `VITE_API_URL` must point to this running backend, not the separate MCP repository. Verify `/api/library/catalog` after deployment before checking the frontend library.
+Only local development may use `AUTH_DISABLED_FOR_LOCAL_DEVELOPMENT=true`; this
+switch is explicitly rejected when `NODE_ENV=production`.

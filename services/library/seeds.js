@@ -2,13 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installSeedBundle } from './store.js';
-import { dataRoot } from './figures.js';
 
 const seedDir = fileURLToPath(new URL('../../seeds/chemistry-remix/', import.meta.url));
 
 /** Restore shipped question content and figures into the configured persistent disk. */
 export function installLibrarySeeds() {
   const seed = JSON.parse(fs.readFileSync(path.join(seedDir, 'bundle.json'), 'utf8'));
+  const dataRoot = path.resolve(process.env.DATA_DIR || process.env.PASTQ_DATA_DIR
+    || fileURLToPath(new URL('../../data/', import.meta.url)));
   const figures = new Map();
   for (const question of seed.questions) {
     for (const figure of question.figures || []) {
@@ -17,7 +18,7 @@ export function installLibrarySeeds() {
       if (!match || match[2] !== figure.file) throw new Error('Invalid seed figure reference');
       const source = path.join(seedDir, 'figures', figure.file);
       fs.accessSync(source, fs.constants.R_OK);
-      figures.set(path.join(dataRoot(), 'pages', match[1], 'figures', figure.file), source);
+      figures.set(path.join(dataRoot, 'pages', match[1], 'figures', figure.file), source);
     }
   }
   for (const [destination, source] of figures) {

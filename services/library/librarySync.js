@@ -1,11 +1,10 @@
 /**
- * Sync completed extraction sessions to VPS library store (primary).
- * Supabase sync is optional via LIBRARY_SYNC_SUPABASE env flag.
+ * Sync completed extraction sessions to the Hostinger VPS library store.
  */
 import { saveSession } from '../vision/store.js';
 import { classifyLibrarySession } from '../vision/libraryClassifier.js';
+import { TAXONOMY_VERSION } from '../vision/educationTaxonomy.js';
 import { upsertSessionToLibrary } from './store.js';
-import { syncSessionToSupabase } from '../vision/supabaseSync.js';
 
 const SYNC_STATUSES = new Set(['completed', 'completed_with_errors']);
 
@@ -25,17 +24,17 @@ export async function syncSessionToLibrary(session, context = {}) {
   }
 
   try {
-    if (!session.libraryMeta) {
+    if (!session.libraryMeta || session.libraryMeta.taxonomyVersion !== TAXONOMY_VERSION) {
       session.libraryMeta = await classifyLibrarySession(session, context);
       saveSession(session);
     }
 
-    const { bundle } = upsertSessionToLibrary(session, session.libraryMeta);
+    // Apply the model's canonical subject names so one subject is one shelf.
+    const canonical = session.libraryMeta.canonicalSubjects || {};
+    for (const q of session.questions) if (canonical[q.subject]) q.subject = canonical[q.subject];
+    saveSession(session);
 
-    let supabaseResult = { synced: false, skipped: true };
-    if (process.env.LIBRARY_SYNC_SUPABASE === 'true') {
-      supabaseResult = await syncSessionToSupabase(session);
-    }
+    const { bundle } = upsertSessionToLibrary(session, session.libraryMeta);
 
     console.log(
       `[library-sync] ${session.id} → bundle ${bundle.id} (${bundle.manufacturer}, ${bundle.questions.length} Q)`
@@ -45,7 +44,6 @@ export async function syncSessionToLibrary(session, context = {}) {
       synced: true,
       bundleId: bundle.id,
       libraryMeta: session.libraryMeta,
-      supabase: supabaseResult,
     };
   } catch (err) {
     console.error('[library-sync] error:', err.message);

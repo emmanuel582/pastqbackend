@@ -9,7 +9,7 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
-        value: "22"
+        value: "22.14.0"
       - key: NODE_ENV
         value: production
       - key: VISION_PROVIDER
@@ -26,3 +26,5 @@ services:
         sync: false
       - key: FRONTEND_URL
         sync: false
+      - key: SESSION_OWNER_HMAC_SECRET
+        generateValue: true

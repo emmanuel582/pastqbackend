@@ -33,27 +33,27 @@ describe('library store', () => {
   it('upsertSessionToLibrary keeps manufacturers as siblings', async () => {
     const store = await import(`../services/library/store.js?test=${Date.now()}-a`);
     const metaA = {
-      university: 'University of Ibadan',
-      examType: 'UI Post UTME',
+      university: 'Biology',
+      examType: 'Past questions',
       manufacturer: 'Primax Preversity',
       manufacturerSource: 'booklet_label',
     };
     const metaB = {
-      university: 'University of Ibadan',
-      examType: 'UI Post UTME',
+      university: 'Biology',
+      examType: 'Past questions',
       manufacturer: 'Success Tutorial',
       manufacturerSource: 'booklet_label',
     };
 
     const sessionA = {
       id: 'sess-a',
-      name: 'UI Primax',
+      name: 'Primax',
       questions: [{ subject: 'Biology', question: 'Primax question one here?', options: ['A', 'B'], year: '2020' }],
       groups: [],
     };
     const sessionB = {
       id: 'sess-b',
-      name: 'UI Success',
+      name: 'Success',
       questions: [{ subject: 'Biology', question: 'Success tutorial question here?', options: ['A', 'B'], year: '2019' }],
       groups: [],
     };
@@ -62,9 +62,9 @@ describe('library store', () => {
     store.upsertSessionToLibrary(sessionB, metaB);
 
     const catalog = store.getCatalog();
-    const ui = catalog.universities.find((u) => u.name === 'University of Ibadan');
+    const ui = catalog.universities.find((u) => u.name === 'Biology');
     assert.ok(ui);
-    const exam = ui.examTypes.find((e) => e.name === 'UI Post UTME');
+    const exam = ui.examTypes.find((e) => e.name === 'Past questions');
     assert.ok(exam);
     assert.equal(exam.manufacturers.length, 2);
     const names = exam.manufacturers.map((m) => m.name).sort();
@@ -74,8 +74,8 @@ describe('library store', () => {
   it('upsertSessionToLibrary merges same manufacturer', async () => {
     const store = await import(`../services/library/store.js?test=${Date.now()}-b`);
     const meta = {
-      university: 'University of Ibadan',
-      examType: 'UI Post UTME',
+      university: 'Biology',
+      examType: 'Past questions',
       manufacturer: 'Primax Preversity',
       manufacturerSource: 'booklet_label',
     };
@@ -103,17 +103,32 @@ describe('library store', () => {
     const bundle = store.getBundle(mfg[0].bundleId);
     assert.equal(bundle.questions.length, 2);
   });
+
+  it('keeps uncertain uploads outside verified organization groups', async () => {
+    const store = await import(`../services/library/store.js?test=${Date.now()}-ungrouped`);
+    store.upsertSessionToLibrary({
+      id: 'uncertain-session', name: 'Random practice sheet', groups: [],
+      questions: [{ subject: 'Biology', question: 'Which structure contains chlorophyll?', options: ['Cell wall', 'Chloroplast'] }],
+    }, {
+      taxonomyVersion: 2,
+      groupingStatus: 'ungrouped',
+      groupConfidence: 0,
+      groupKey: null,
+      organization: { name: null, confidence: 0, evidence: [] },
+      exam: { name: null, confidence: 0, evidence: [] },
+      publisher: { name: null, confidence: 0, evidence: [] },
+      reasonCodes: ['organization_not_evidenced'],
+    });
+    const catalog = store.getCatalog();
+    assert.equal(catalog.organizations.length, 0);
+    assert.equal(catalog.ungrouped.length, 1);
+  });
 });
 
-describe('libraryClassifier manufacturerKey', () => {
+describe('libraryClassifier', () => {
   it('builds stable manufacturer keys', async () => {
     const { manufacturerKey } = await import('../services/vision/libraryClassifier.js');
-    const key = manufacturerKey({
-      university: 'University of Ibadan',
-      examType: 'UI Post UTME',
-      manufacturer: 'Primax Preversity',
-    });
-    assert.match(key, /university-of-ibadan/);
-    assert.match(key, /primax-preversity/);
+    const key = manufacturerKey({ university: 'Biology', examType: 'Past questions', manufacturer: 'Primax Preversity' });
+    assert.equal(key, 'biology::past-questions::primax-preversity');
   });
 });

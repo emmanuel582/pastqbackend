@@ -1,0 +1,36 @@
+services:
+  pastq-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pastq-api:latest
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATA_DIR: /var/lib/pastq
+      LIBRARY_SYNC_SUPABASE: "false"
+    # Nginx on the VPS terminates TLS and proxies to this private loopback port.
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - pastq-hostinger-data:/var/lib/pastq
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    # Let in-flight model calls finish their current write before the container stops.
+    stop_grace_period: 30s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  pastq-hostinger-data:

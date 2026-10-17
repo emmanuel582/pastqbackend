@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { nanoid } from 'nanoid';
+import { gzipSync } from 'node:zlib';
 import { normalizeText } from '../vision/educationTaxonomy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -14,8 +15,14 @@ function libraryDir() {
 }
 function bundlesDir() { return path.join(libraryDir(), 'bundles'); }
 function catalogFile() { return path.join(libraryDir(), 'catalog.json'); }
+function aliasesFile() { return path.join(libraryDir(), 'aliases.json'); }
+function summariesDir() { return path.join(libraryDir(), 'summaries'); }
+function readAliases() {
+  if (!fs.existsSync(aliasesFile())) return {};
+  return JSON.parse(fs.readFileSync(aliasesFile(), 'utf8'));
+}
 function ensureDirs() {
-  for (const dir of [libraryDir(), bundlesDir()]) if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  for (const dir of [libraryDir(), bundlesDir(), summariesDir()]) if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 ensureDirs();
 
@@ -102,8 +109,17 @@ function bundlePath(id) {
   if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw new Error('Invalid bundle id');
   return path.join(bundlesDir(), `${id}.json`);
 }
+function resolvedBundlePath(id) {
+  const aliases = readAliases();
+  const visited = new Set();
+  while (Object.hasOwn(aliases, id)) {
+    if (visited.has(id) || visited.size > 8) throw new Error('Invalid library alias');
+    visited.add(id); id = aliases[id];
+  }
+  return bundlePath(id);
+}
 export function getBundle(id) {
-  const target = bundlePath(id);
+  const target = resolvedBundlePath(id);
   if (!fs.existsSync(target)) return null;
   try { return JSON.parse(fs.readFileSync(target, 'utf8')); } catch { return null; }
 }
@@ -112,7 +128,26 @@ export function saveBundle(bundle) {
   bundle.updated_at = new Date().toISOString();
   if (!bundle.created_at) bundle.created_at = bundle.updated_at;
   writeAtomic(bundlePath(bundle.id), bundle);
+  if (bundle.kind === 'utme-bank') {
+    const target = bundlePath(bundle.id);
+    const temp = `${target}.gz.tmp`;
+    fs.writeFileSync(temp, gzipSync(fs.readFileSync(target), { level: 6 }));
+    fs.renameSync(temp, `${target}.gz`);
+    writeAtomic(path.join(summariesDir(), path.basename(target)), {
+      ...bundle, questions: undefined, assets: undefined, libraryStats: deriveStats(bundle.questions, bundle.libraryMeta),
+    });
+  }
   return bundle;
+}
+
+export function getBundleDownload(id, acceptGzip = false) {
+  const file = resolvedBundlePath(id);
+  if (!fs.existsSync(file)) return null;
+  const compressed = `${file}.gz`;
+  if (acceptGzip && fs.existsSync(compressed) && fs.statSync(compressed).mtimeMs >= fs.statSync(file).mtimeMs) {
+    return { file: compressed, encoding: 'gzip' };
+  }
+  return { file, encoding: null };
 }
 
 function letterToIndex(letter) {
@@ -148,10 +183,15 @@ export function applyAnswersToBundle(bundleId, updates = []) {
   return { ok: true, bundleId, applied, notFound, questionCount: (bundle.questions || []).length };
 }
 
-export function listBundles() {
+export function listBundles({ summaries = false } = {}) {
   ensureDirs();
-  return fs.readdirSync(bundlesDir()).filter((file) => file.endsWith('.json')).map((file) => {
-    try { return JSON.parse(fs.readFileSync(path.join(bundlesDir(), file), 'utf8')); } catch { return null; }
+  const aliases = readAliases();
+  return fs.readdirSync(bundlesDir()).filter((file) => file.endsWith('.json') && !Object.hasOwn(aliases, file.slice(0, -5))).map((file) => {
+    try {
+      const full = path.join(bundlesDir(), file), summary = path.join(summariesDir(), file);
+      const source = summaries && fs.existsSync(summary) && fs.statSync(summary).mtimeMs >= fs.statSync(full).mtimeMs ? summary : full;
+      return JSON.parse(fs.readFileSync(source, 'utf8'));
+    } catch { return null; }
   }).filter(Boolean).sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
 }
 
@@ -182,7 +222,7 @@ function deriveStats(questions, meta = null) {
   };
 }
 
-function materialSummary(bundle, stats = deriveStats(bundle.questions, bundle.libraryMeta)) {
+function materialSummary(bundle, stats = bundle.libraryStats || deriveStats(bundle.questions, bundle.libraryMeta)) {
   return {
     id: bundle.id, bundleId: bundle.id, title: bundle.title, name: bundle.publisher || bundle.title, icon: bundle.icon || '📚',
     publisher: bundle.publisher || null, groupingStatus: bundle.groupingStatus,
@@ -327,6 +367,22 @@ function removeBundleFromCatalog(catalog, bundleId) {
   catalog.organizations = (catalog.organizations || []).filter((organization) => organization.examTypes.length > 0);
 }
 
+/** Publish one complete collection; keep old files and resolve saved source links to it. */
+export function replaceLibraryCollections(bundle, previousIds) {
+  if (!Array.isArray(previousIds) || previousIds.includes(bundle.id)) throw new Error('Invalid replaced collections');
+  previousIds.forEach(id => bundlePath(id));
+  const aliases = readAliases();
+  if (aliases[bundle.id]) throw new Error('Canonical bundle cannot be an alias');
+  saveBundle(bundle);
+  const catalog = readCatalog();
+  for (const id of previousIds) removeBundleFromCatalog(catalog, id);
+  upsertCatalogEntry(catalog, bundle.libraryMeta, bundle);
+  writeCatalog(catalog);
+  for (const id of previousIds) aliases[id] = bundle.id;
+  writeAtomic(aliasesFile(), aliases);
+  return bundle;
+}
+
 export function reclassifyBundle(bundleId, input = {}) {
   const bundle = getBundle(bundleId);
   if (!bundle) return { ok: false, error: 'Bundle not found' };
@@ -365,21 +421,21 @@ export function reclassifyBundle(bundleId, input = {}) {
 }
 
 export function searchBundles({ query, university, examType, manufacturer, organization, stream } = {}) {
-  let bundles = listBundles();
+  let bundles = listBundles({ summaries: true });
   const orgFilter = organization || university;
   if (orgFilter) bundles = bundles.filter((bundle) => slugify(bundle.organization?.name || bundle.university) === slugify(orgFilter));
   if (examType) bundles = bundles.filter((bundle) => slugify(bundle.exam?.name || bundle.examType) === slugify(examType));
   if (manufacturer) bundles = bundles.filter((bundle) => slugify(bundle.publisher || bundle.manufacturer) === slugify(manufacturer));
-  if (stream) bundles = bundles.filter((bundle) => deriveStats(bundle.questions, bundle.libraryMeta).streams.includes(String(stream).toLowerCase()));
+  if (stream) bundles = bundles.filter((bundle) => (bundle.libraryStats || deriveStats(bundle.questions, bundle.libraryMeta)).streams.includes(String(stream).toLowerCase()));
   if (query) {
     const needle = String(query).toLowerCase();
     bundles = bundles.filter((bundle) => [bundle.title, bundle.organization?.name, bundle.exam?.name, bundle.publisher,
-      ...(deriveStats(bundle.questions, bundle.libraryMeta).subjects || [])].filter(Boolean).some((value) => String(value).toLowerCase().includes(needle)));
+      ...((bundle.libraryStats || deriveStats(bundle.questions, bundle.libraryMeta)).subjects || [])].filter(Boolean).some((value) => String(value).toLowerCase().includes(needle)));
   }
   return bundles.map((bundle) => ({
     ...materialSummary(bundle), title: bundle.title, university: bundle.organization?.name || bundle.university,
     organization: bundle.organization, examType: bundle.exam?.name || bundle.examType,
-    manufacturer: bundle.publisher || bundle.manufacturer, question_count: (bundle.questions || []).length,
+    manufacturer: bundle.publisher || bundle.manufacturer, question_count: bundle.libraryStats?.questionCount ?? (bundle.questions || []).length,
     updated_at: bundle.updated_at,
   }));
 }

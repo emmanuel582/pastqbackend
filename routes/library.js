@@ -2,6 +2,7 @@ import { Router } from 'express';
 import {
   getCatalog,
   getBundle,
+  getBundleDownload,
   listBundles,
   searchBundles,
   upsertSessionToLibrary,
@@ -113,9 +114,11 @@ router.patch('/bundles/:id/classification', requireAuthenticatedUser, requireAdm
 
 router.get('/bundles/:id', (req, res) => {
   try {
-    const bundle = getBundle(req.params.id);
-    if (!bundle) return res.status(404).json({ error: 'Bundle not found' });
-    res.json(bundle);
+    const download = getBundleDownload(req.params.id, !!req.get('Accept-Encoding') && !!req.acceptsEncodings('gzip'));
+    if (!download) return res.status(404).json({ error: 'Bundle not found' });
+    res.vary('Accept-Encoding');
+    if (download.encoding) res.set('Content-Encoding', download.encoding);
+    res.type('application/json').sendFile(download.file);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -157,7 +160,7 @@ router.get('/figures/:sessionId/:file', (req, res) => {
 /** Flat list fallback for legacy clients */
 router.get('/', (_req, res) => {
   try {
-    const bundles = listBundles().map((b) => ({
+    const bundles = listBundles({ summaries: true }).map((b) => ({
       id: b.id,
       title: b.title || b.name,
       name: b.name,

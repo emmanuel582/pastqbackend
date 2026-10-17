@@ -18,6 +18,8 @@ SQLite claims prevent overlapping schedulers from processing the same daily inte
 
 The push-only service worker never caches authentication or API responses. Notification navigation is restricted to the app's origin. Existing windows receive a message rather than a forced reload, preserving a running exam. The browser/OS controls notification styling, delivery timing and Focus modes; this implementation is Web Push, not an iOS Live Activity or native Android service.
 
+Scholar now supplies a first-party portrait icon and a larger expression image for both tests and scheduled reminders. Real activity chooses welcome, gentle encouragement or celebration; private wording always uses the neutral welcome expression. The worker accepts only these known local assets and ignores arbitrary payload image URLs. The test action refreshes an existing worker before sending so an old installation cannot discard the artwork. Browser/OS support determines whether the larger image or custom icon appears; see [notification image options](https://developer.mozilla.org/en-US/docs/Web/API/ServiceWorkerRegistration/showNotification). Asset prompts and final paths are recorded in [Scholar reminder artwork](scholar-reminder-art.md).
+
 ## Runtime and storage
 
 - Run the matching backend release on Node.js 22.13+ in an always-on process. Sleeping hosts delay scheduled checks.

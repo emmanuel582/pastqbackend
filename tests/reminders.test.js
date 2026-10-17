@@ -7,11 +7,22 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import express from 'express';
 import webpush from 'web-push';
+import { reminderArtwork } from '../services/reminders/artwork.js';
 import { defaultSettings, validateSettings, validateActivity, planReminder, localClock, studyTime } from '../services/reminders/planner.js';
 const now = new Date('2026-10-16T18:05:00Z');
 const settings = () => ({ ...defaultSettings(), enabled: true, mode: 'scheduled' });
 const activity = (id, at, subject = 'Physics', score = 4) => ({ id, at, subject, score, total: 10, durationSeconds: 1200 });
 function subscription(suffix = 'one') { const curve = crypto.createECDH('prime256v1'); curve.generateKeys(); return { endpoint: `https://fcm.googleapis.com/fcm/send/${suffix}`, keys: { p256dh: curve.getPublicKey().toString('base64url'), auth: crypto.randomBytes(16).toString('base64url') } }; }
+
+test('Scholar expressions follow real study context and remain neutral when details are private', () => {
+  assert.equal(planReminder(settings(), [], now).mood, 'welcome');
+  assert.equal(planReminder(settings(), [activity('yesterday', '2026-10-15T12:00:00Z')], now).mood, 'celebrate');
+  const older = [activity('returning', '2026-10-10T12:00:00Z')];
+  assert.equal(planReminder(settings(), older, now).mood, 'focus');
+  assert.equal(planReminder({ ...settings(), personalized: false }, older, now).mood, 'welcome');
+  for (const mood of ['welcome', 'focus', 'celebrate']) assert.deepEqual(reminderArtwork(mood), { mood, icon: `/pets/scholar/reminders/${mood}-icon-v1.png`, image: `/pets/scholar/reminders/${mood}-v1.jpg` });
+  assert.equal(reminderArtwork('../../tracking').mood, 'welcome');
+});
 test('study reminders follow local days, quiet hours, pauses, and completed study instead of timers in a tab', () => {
   assert.equal(planReminder(settings(), [], now).due, true);
   assert.equal(planReminder(settings(), [], new Date('2026-10-16T20:05:00Z')).due, false);
@@ -79,7 +90,7 @@ test('push keys survive restart and real Web Push encryption is generated withou
 test('a test notification reaches only an opted-in owned device and cleans expired connections', async t => {
   const store = await isolatedStore(t), { sendTestReminder } = await import('../services/reminders/delivery.js');
   const device = subscription('personal-device'); store.saveSubscription('student-a', device); store.saveSettings('student-a', settings()); let sent = 0;
-  const send = async (target, payload) => { sent++; assert.equal(target.endpoint, device.endpoint); assert.equal(payload.tag, 'pastq-test'); };
+  const send = async (target, payload) => { sent++; assert.equal(target.endpoint, device.endpoint); assert.equal(payload.tag, 'pastq-test'); assert.equal(payload.icon, '/pets/scholar/reminders/welcome-icon-v1.png'); assert.equal(payload.image, '/pets/scholar/reminders/welcome-v1.jpg'); };
   await sendTestReminder('student-a', device.endpoint, send); assert.equal(sent, 1);
   await assert.rejects(sendTestReminder('student-b', device.endpoint, send)); assert.equal(sent, 1);
   store.saveSettings('student-a', { ...settings(), enabled: false }); await assert.rejects(sendTestReminder('student-a', device.endpoint, send)); assert.equal(sent, 1);

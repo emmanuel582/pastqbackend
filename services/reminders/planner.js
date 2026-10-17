@@ -43,10 +43,13 @@ export function planReminder(settings, activity, now = new Date()) {
   }
   const weakest = activity.filter(item => item.subject && item.total > 0).reduce((before, item) => !before || item.score / item.total < before.score / before.total ? item : before, null);
   const subject = settings.personalized ? weakest?.subject || activity.find(item => item.subject)?.subject || '' : '';
+  const newest = activity.reduce((latest, item) => !latest || item.at > latest.at ? item : latest, null);
+  const returning = newest && now.getTime() - Date.parse(newest.at) >= 3 * 86400000;
+  const mood = !settings.personalized || !activity.length ? 'welcome' : streak > 0 ? 'celebrate' : returning || weakest && weakest.score / weakest.total < .75 ? 'focus' : 'welcome';
   const title = !settings.personalized ? 'A study moment with Scholar' : streak > 0 ? `A little practice keeps your ${streak}-day rhythm` : activity.length ? 'Scholar saved you a study moment' : 'Your first study moment';
   const body = subject ? `A short ${subject} session? Pick up where you left off.` : activity.length ? 'Come back for a short practice session. One step at a time.' : 'Start with a few questions. Scholar is here to help.';
   const due = settings.enabled && !(settings.pausedUntil && Date.parse(settings.pausedUntil) > now.getTime()) && settings.days.includes(local.weekday) && !studiedToday && !inQuietHours(local.minute, settings) && local.minute >= target && local.minute < Math.min(1440, target + 90);
-  return { due, day: local.day, studiedToday, streak, targetTime: `${String(Math.floor(target / 60)).padStart(2, '0')}:${String(target % 60).padStart(2, '0')}`, title, body, subject, url: `/?reminder=study${subject ? `&subject=${encodeURIComponent(subject)}` : ''}` };
+  return { due, day: local.day, studiedToday, streak, mood, targetTime: `${String(Math.floor(target / 60)).padStart(2, '0')}:${String(target % 60).padStart(2, '0')}`, title, body, subject, url: `/?reminder=study${subject ? `&subject=${encodeURIComponent(subject)}` : ''}` };
 }
 export function validateActivity(input, now = Date.now()) {
   if (!Array.isArray(input) || input.length > 100) invalid('Provide up to 100 study sessions.');

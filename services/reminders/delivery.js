@@ -2,6 +2,7 @@ import webpush from 'web-push';
 import crypto from 'node:crypto';
 import * as store from './store.js';
 import { planReminder } from './planner.js';
+import { reminderArtwork } from './artwork.js';
 export function pushConfiguration() {
   const subject = process.env.WEB_PUSH_SUBJECT || (process.env.FRONTEND_URL || '').split(',').map(value => value.trim()).find(value => value.startsWith('https://')) || '';
   if (!/^(https:\/\/[^\s]+|mailto:[^\s@]+@[^\s@]+)$/.test(subject)) return null;
@@ -29,7 +30,8 @@ export async function sendTestReminder(owner, endpoint, send = sendPush) {
   if (!store.readSettings(owner).enabled) throw Object.assign(new Error('Enable study reminders before sending a test.'), { status: 409 });
   const device = store.subscriptions(owner).find(item => item.id === store.subscriptionId(endpoint));
   if (!device) throw Object.assign(new Error('Connect this device before testing reminders.'), { status: 404 });
-  try { await send(device, { title: 'Scholar is ready', body: 'Your study reminders are connected.', url: '/?reminder=study', tag: 'pastq-test', icon: '/pastq-icon-192.png' }); }
+  const plan = planReminder(store.readSettings(owner), store.readActivity(owner));
+  try { await send(device, { title: 'Scholar is ready', body: 'Your study reminders are connected.', url: '/?reminder=study', tag: 'pastq-test', ...reminderArtwork(plan.mood) }); }
   catch (error) {
     if ([404, 410].includes(error.statusCode)) { store.removeSubscription(owner, device.id); throw Object.assign(new Error('This notification connection expired. Reopen this page and connect this device again.'), { status: 410 }); }
     throw Object.assign(new Error('The notification could not be delivered. Please try again shortly.'), { status: 502 });
@@ -45,7 +47,7 @@ export async function dispatchDueReminders({ now = new Date(), send = sendPush }
     let delivered = false;
     for (const subscription of store.subscriptions(owner)) {
       if (!store.readSettings(owner).enabled) break;
-      try { await send(subscription, { title: plan.title, body: plan.body, url: plan.url, tag: `pastq-study-${plan.day}`, icon: '/pastq-icon-192.png', badge: '/pastq-icon-192.png' }); delivered = true; }
+      try { await send(subscription, { title: plan.title, body: plan.body, url: plan.url, tag: `pastq-study-${plan.day}`, ...reminderArtwork(plan.mood) }); delivered = true; }
       catch (error) { if ([404, 410].includes(error.statusCode)) store.removeSubscription(owner, subscription.id); }
     }
     store.markDelivery(owner, plan.day, delivered);

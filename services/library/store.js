@@ -218,7 +218,7 @@ function findGroupedBundle(catalog, meta) {
   const organization = catalog.organizations.find((item) => item.id === meta.groupKey);
   const examId = slugify(meta.exam?.name || 'materials');
   const exam = organization?.examTypes?.find((item) => item.id === examId);
-  const collectionKey = slugify(meta.publisher?.name || meta.exam?.name || 'official-materials');
+  const collectionKey = slugify(meta.collectionKey || meta.publisher?.name || meta.exam?.name || 'official-materials');
   const material = exam?.materials?.find((item) => item.collectionKey === collectionKey);
   return material?.bundleId ? getBundle(material.bundleId) : null;
 }
@@ -253,7 +253,7 @@ function upsertCatalogEntry(catalog, meta, bundle) {
     exam = { id: examId, slug: examId, name: examName, kind: meta.exam?.kind || 'other', materials: [] };
     organization.examTypes.push(exam);
   }
-  const collectionKey = slugify(meta.publisher?.name || examName || 'official-materials');
+  const collectionKey = slugify(meta.collectionKey || meta.publisher?.name || examName || 'official-materials');
   const summary = { ...materialSummary(bundle, stats), collectionKey };
   const existingIndex = exam.materials.findIndex((item) => item.collectionKey === collectionKey);
   if (existingIndex >= 0) exam.materials[existingIndex] = summary;

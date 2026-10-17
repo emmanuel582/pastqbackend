@@ -71,4 +71,19 @@ describe('shipped Chemistry Remix library', () => {
     assert.equal(store.getBundle(bundle.id).questions[0].explanation, 'Keep this correction');
     assert.equal(store.getCatalog().organizations.length, 1);
   });
+
+  it('retains separate subject collections by one publisher without dropping repeated questions', () => {
+    const meta = { taxonomyVersion: 2, groupingStatus: 'grouped', groupKey: 'jamb',
+      organization: { name: 'JAMB', type: 'exam_board' }, exam: { name: 'UTME' }, publisher: { name: 'TestDriller' } };
+    const questions = [{ question: 'The same printed question', options: ['A', 'B'], correct: 0 },
+      { question: 'The same printed question', options: ['B', 'A'], correct: 1 }];
+    for (const subject of ['biology', 'physics']) {
+      const bundle = { id: `utme-${subject}`, title: subject, questions, libraryMeta: { ...meta, collectionKey: subject } };
+      assert.equal(store.installSeedBundle(bundle).installed, true);
+      assert.equal(store.installSeedBundle(bundle).installed, false);
+      assert.equal(store.getBundle(bundle.id).questions.length, 2);
+    }
+    const materials = store.getCatalog().organizations[0].examTypes[0].materials;
+    assert.deepEqual(materials.map(item => item.bundleId).sort(), ['utme-biology', 'utme-physics']);
+  });
 });

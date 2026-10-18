@@ -128,7 +128,7 @@ export function saveBundle(bundle) {
   bundle.updated_at = new Date().toISOString();
   if (!bundle.created_at) bundle.created_at = bundle.updated_at;
   writeAtomic(bundlePath(bundle.id), bundle);
-  if (bundle.kind === 'utme-bank') {
+  if (bundle.kind === 'utme-bank' || bundle.kind === 'waec-bank') {
     const target = bundlePath(bundle.id);
     const temp = `${target}.gz.tmp`;
     fs.writeFileSync(temp, gzipSync(fs.readFileSync(target), { level: 6 }));

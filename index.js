@@ -9,6 +9,7 @@ import { installLibrarySeeds } from './services/library/seeds.js';
 import recommendationRoutes from './routes/recommendations.js';
 import reminderRoutes from './routes/reminders.js';
 import discoverRoutes from './routes/discover.js';
+import questionReports from './routes/questionReports.js';
 import { startReminderScheduler } from './services/reminders/delivery.js';
 import fs from 'fs';
 import { getDataRoot } from './services/vision/store.js';
@@ -83,6 +84,7 @@ app.use('/api/library', libraryRoutes);
 app.use('/api/recommendations', recommendationRoutes);
 app.use('/api/reminders', reminderRoutes);
 app.use('/api/discover', discoverRoutes);
+app.use('/api/question-reports', questionReports);
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });

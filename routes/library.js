@@ -13,8 +13,9 @@ import { getLibraryActivity } from '../services/library/activity.js';
 import { getSession, saveSession } from '../services/vision/store.js';
 import { classifyLibrarySession } from '../services/vision/libraryClassifier.js';
 import { TAXONOMY_VERSION } from '../services/vision/educationTaxonomy.js';
-import { requireAdmin, requireAuthenticatedUser } from '../services/auth/middleware.js';
+import { requireAdmin, requireAuthenticatedUser, ownsSession } from '../services/auth/middleware.js';
 import { figurePath } from '../services/vision/figures.js';
+import { partitionBundle, partDownload } from '../services/library/downloadParts.js';
 
 const router = Router();
 
@@ -112,6 +113,15 @@ router.patch('/bundles/:id/classification', requireAuthenticatedUser, requireAdm
   }
 });
 
+router.get('/bundles/:id/manifest', (req, res) => {
+  try { const bundle=getBundle(req.params.id); if (!bundle || bundle.libraryVisibility === 'private') return res.status(404).json({error:'Bundle not found'}); res.set('Cache-Control','no-cache').json(partitionBundle(bundle)); }
+  catch { res.status(400).json({error:'Could not prepare this download'}); }
+});
+router.get('/bundles/:id/parts/:hash', (req,res) => {
+  const download=partDownload(req.params.id,req.params.hash,!!req.get('Accept-Encoding')&&!!req.acceptsEncodings('gzip')); if (!download) return res.status(404).json({error:'Download part unavailable. Refresh the download.'});
+  res.vary('Accept-Encoding');if(download.encoding)res.set('Content-Encoding',download.encoding);
+  res.set('Cache-Control','public, max-age=31536000, immutable').type('application/json').sendFile(download.file);
+});
 router.get('/bundles/:id', (req, res) => {
   try {
     const download = getBundleDownload(req.params.id, !!req.get('Accept-Encoding') && !!req.acceptsEncodings('gzip'));
@@ -150,10 +160,18 @@ router.post('/bundles/:id/merge', requireAuthenticatedUser, requireAdmin, async 
  * Question figures (exact crops of the source page). Served without auth so
  * <img src> works; file names carry a random suffix and are validated strictly.
  */
-router.get('/figures/:sessionId/:file', (req, res) => {
+router.get('/figures/:sessionId/:file', (req, res, next) => {
+  let session;
+  try { session = getSession(req.params.sessionId); } catch { return res.status(404).json({error:'Figure not found'}); }
+  if (session?.libraryVisibility !== 'private') return next();
+  requireAuthenticatedUser(req,res,() => {
+    if (!ownsSession(req,session)) return res.status(404).json({error:'Figure not found'});
+    res.set('Cache-Control','private, no-store'); next();
+  });
+}, (req, res) => {
   const full = figurePath(req.params.sessionId, req.params.file);
   if (!full) return res.status(404).json({ error: 'Figure not found' });
-  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  if (!res.get('Cache-Control')) res.set('Cache-Control', 'public, max-age=31536000, immutable');
   res.type('image/jpeg').sendFile(full);
 });
 

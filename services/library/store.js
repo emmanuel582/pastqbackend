@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import { nanoid } from 'nanoid';
 import { gzipSync } from 'node:zlib';
 import { normalizeText } from '../vision/educationTaxonomy.js';
+import { reviewQuestions } from '../vision/reviewedMaterials.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -125,6 +126,11 @@ export function getBundle(id) {
 }
 export function saveBundle(bundle) {
   ensureDirs();
+  if(bundle.sourceAudit&&Array.isArray(bundle.questions)){
+    const references=new Set();let placements=0;
+    for(const q of bundle.questions)for(const html of [q.questionHtml,...(q.optionsHtml||[]),q.answerHtml,q.explanationHtml,q.passage])for(const match of String(html||'').matchAll(/pastq-asset:([a-f0-9]{64})/g)){placements++;references.add(match[1]);}
+    bundle.sourceAudit={...bundle.sourceAudit,questions:bundle.questions.length,imageReferences:placements,uniqueImages:references.size,reviewedQuestions:bundle.questions.filter(q=>['admin_review','manual_apply'].includes(q.answerSource)).length};
+  }
   bundle.updated_at = new Date().toISOString();
   if (!bundle.created_at) bundle.created_at = bundle.updated_at;
   writeAtomic(bundlePath(bundle.id), bundle);
@@ -167,16 +173,11 @@ export function applyAnswersToBundle(bundleId, updates = []) {
       question = (bundle.questions || []).find((item) => Number(item.questionNumber) === Number(update.questionNumber));
     }
     if (!question) { notFound.push(update); continue; }
-    if (update.correctLetter != null) {
-      question.correctLetter = String(update.correctLetter).toUpperCase();
-      question.correct = letterToIndex(update.correctLetter);
-    } else if (update.correct != null) {
-      const letterIndex = typeof update.correct === 'string' ? letterToIndex(update.correct) : null;
-      question.correct = letterIndex != null ? letterIndex : update.correct;
-    }
-    if (update.explanation != null) question.explanation = update.explanation;
-    question.needsReview = false;
-    question.answerSource = 'manual_apply';
+    let correct=question.correct;
+    if(update.correctLetter!=null){correct=letterToIndex(update.correctLetter);if(correct===null)throw Object.assign(new Error('Invalid answer letter'),{status:400});}
+    else if(update.correct!=null){const index=typeof update.correct==='string'?letterToIndex(update.correct):null;correct=index??update.correct;}
+    const [edited]=reviewQuestions({status:'completed',questions:[question]},[{...question,correct,explanation:update.explanation??question.explanation}]);
+    Object.assign(question,edited,{answerSource:'manual_apply'});
     applied += 1;
   }
   saveBundle(bundle);
